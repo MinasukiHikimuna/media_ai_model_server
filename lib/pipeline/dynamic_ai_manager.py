@@ -92,11 +92,19 @@ class DynamicAIManager:
             pipeline_name=pipeline_name,
             model_config=model_config,
         )
+        normalized_mode_early = (mode or "").lower()
+        if len(selected_models) == 0 and normalized_mode_early == "asset":
+            # An asset-scope stage is optional by construction: most deployments
+            # install no asset model at all. Returning an empty-but-complete
+            # stage keeps the rest of the pipeline working instead of failing
+            # the whole pipeline load.
+            return self._create_dynamic_asset_wrappers(inputs, outputs, [])
         if len(selected_models) == 0:
             # Face-only (or detector-only) pipelines have no full-image
             # tagging models but DO have detector + region models.  Allow
             # empty selection when region branches are configured.
             has_region_branches = False
+            has_asset_models = False
             if pipeline_name:
                 _det_names = self.model_capabilities.resolve_model_names_for_stage(
                     pipeline_name=pipeline_name,
@@ -105,7 +113,11 @@ class DynamicAIManager:
                 )
                 _region_rules = self.model_capabilities.get_region_model_rules(pipeline_name, available_models=self.models)
                 has_region_branches = bool(_det_names) and bool(_region_rules)
-            if not has_region_branches:
+                # A pipeline whose only active models are asset-scope (e.g. a
+                # shot-boundary-only deployment) has nothing to run per frame,
+                # which is a valid configuration rather than an error.
+                has_asset_models = bool(self._select_models(required_scope="asset"))
+            if not has_region_branches and not has_asset_models:
                 requested_caps = _normalize_string_list(required_capabilities)
                 requested_scope = required_scope or "any"
                 raise ValueError(
@@ -136,8 +148,10 @@ class DynamicAIManager:
             return self._create_dynamic_region_wrappers(inputs, outputs, selected_models)
         if normalized_mode == "audio":
             return self._create_dynamic_audio_wrappers(inputs, outputs, selected_models, pipeline_name=pipeline_name)
+        if normalized_mode == "asset":
+            return self._create_dynamic_asset_wrappers(inputs, outputs, selected_models)
 
-        raise ValueError(f"Error: Unsupported dynamic mode '{mode}'. Expected 'image', 'video', 'region', or 'audio'.")
+        raise ValueError(f"Error: Unsupported dynamic mode '{mode}'. Expected 'image', 'video', 'region', 'audio', or 'asset'.")
 
     def get_dynamic_models_from_config(self, model_config, pipeline_name=None):
         mode = model_config.get("dynamic_mode", None)
@@ -159,6 +173,15 @@ class DynamicAIManager:
 
     def get_dynamic_audio_ai_models(self, inputs, outputs, pipeline_name=None):
         return self.get_dynamic_models(mode="audio", inputs=inputs, outputs=outputs, pipeline_name=pipeline_name)
+
+    def get_dynamic_asset_ai_models(self, inputs, outputs, pipeline_name=None):
+        return self.get_dynamic_models(
+            mode="asset",
+            inputs=inputs,
+            outputs=outputs,
+            required_scope="asset",
+            pipeline_name=pipeline_name,
+        )
 
     def get_dynamic_region_ai_models(self, inputs, outputs, required_capabilities=None, pipeline_name=None):
         return self.get_dynamic_models(
@@ -185,6 +208,13 @@ class DynamicAIManager:
         else:
             video_preprocessor = self.model_manager.get_or_create_model("video_preprocessor_dynamic")
         video_preprocessor.model.specs = all_specs
+        # Every active model that is not asset-only feeds off this preprocessor
+        # (full-image, detector and region alike), so deriving the set from
+        # scope rather than from the wiring cannot under-count and silently
+        # skip a decode that was actually needed.
+        video_preprocessor.model.downstream_model_names = _downstream_model_names(
+            [m for m in self.models if set(getattr(m.model, "supported_target_scopes", []) or []) != {"asset"}]
+        )
 
         # Build output names: fixed outputs + one per spec.
         fixed_outputs = [
@@ -426,6 +456,33 @@ class DynamicAIManager:
         self.logger.debug("Finished creating dynamic Audio AI models")
         return model_wrappers
 
+    def _create_dynamic_asset_wrappers(self, inputs, outputs, models):
+        """Wire asset-scope models directly onto the parent future.
+
+        Asset-scope models consume the asset itself (a video path) rather than
+        preprocessed frames, and return a single result for the whole asset, so
+        there is no preprocessor and no child fan-out here.  Each model reads
+        the stage's declared inputs and writes its own categories; a collector
+        gathers those into the stage output.
+
+        ``models`` may legitimately be empty: the collector is still wired (on
+        the asset input alone) so the stage completes and the pipeline's
+        downstream join is satisfied.
+        """
+        model_wrappers = []
+        for model in models:
+            model_wrappers.append(ModelWrapper(model, list(inputs), model.model.model_category))
+
+        collector_inputs = [inputs[0]] + _dedupe_strings(self._build_coalesce_inputs(models))
+        model_wrappers.append(ModelWrapper(
+            self.model_manager.get_or_create_model("asset_result_collector"),
+            collector_inputs,
+            outputs,
+        ))
+
+        self.logger.debug(f"Finished creating dynamic Asset AI models ({len(models)} model(s))")
+        return model_wrappers
+
     def _select_models(self, required_capabilities=None, required_scope=None, mode=None, pipeline_name=None, model_config=None):
         normalized_capabilities = set(_normalize_string_list(required_capabilities) or [])
         normalized_scope = str(required_scope).strip() if required_scope is not None else None
@@ -451,6 +508,13 @@ class DynamicAIManager:
                 continue
             if normalized_scope is not None and normalized_scope not in model_scopes:
                 continue
+            # A model that only supports asset scope consumes the whole asset and
+            # cannot serve a per-frame or per-region stage. Pipelines that declare
+            # no stage constraints in model_capabilities.yaml (the v3 pipelines)
+            # would otherwise wire it in as a frame model and hand it a single
+            # preprocessed frame.
+            if normalized_scope is None and dynamic_stage != "asset" and model_scopes == {"asset"}:
+                continue
             selected.append(model)
 
         return selected
@@ -460,6 +524,8 @@ class DynamicAIManager:
             return "region"
         if str(mode or "").strip().lower() == "audio":
             return "audio"
+        if str(mode or "").strip().lower() == "asset":
+            return "asset"
         if "detection" in normalized_capabilities:
             return "detector"
         return "full_image"
@@ -698,9 +764,14 @@ class DynamicAIManager:
                     raise ValueError(f"Error: Dynamic AI models must have model_category set! {inner_model} does not have model_category set and needs a migration")
                 if inner_model.model_version is None:
                     raise ValueError(f"Error: Dynamic AI models must have model_version set! {inner_model} does not have model_version set and needs a migration")
-                # Audio models don't use model_image_size — skip check for them.
-                is_audio = inner_model.model_type and "audio" in inner_model.model_type.lower()
-                if not is_audio and inner_model.model_image_size is None:
+                # model_image_size describes what the SHARED frame preprocessor must
+                # produce. Models that never consume it have no size to declare:
+                # audio models, and asset-scope models that drive their own decode
+                # (e.g. temporal segmentation over a whole video).
+                is_audio = bool(inner_model.model_type) and "audio" in inner_model.model_type.lower()
+                is_asset_only = set(inner_model.supported_target_scopes or []) == {"asset"}
+                uses_frame_preprocessor = not is_audio and not is_asset_only
+                if uses_frame_preprocessor and inner_model.model_image_size is None:
                     raise ValueError(f"Error: Dynamic AI models must have model_image_size set! {inner_model} does not have model_image_size set and needs a migration")
             except ValueError as e:
                 if second_pass:
@@ -714,9 +785,9 @@ class DynamicAIManager:
                 self.__verify_models(models, True)
                 return
 
-            if first_image_size is None and not is_audio:
+            if first_image_size is None and uses_frame_preprocessor:
                 first_image_size = inner_model.model_image_size
-            if first_norm_config is None and not is_audio:
+            if first_norm_config is None and uses_frame_preprocessor:
                 first_norm_config = inner_model.normalization_config
         if first_image_size is not None:
             self.image_size = first_image_size
@@ -818,6 +889,23 @@ def _normalize_string_list(value: Optional[Iterable[str]]) -> Optional[List[str]
         if text:
             normalized.append(text)
     return normalized or None
+
+
+def _downstream_model_names(*model_groups) -> set:
+    """Config/file names of every model fed by a preprocessor.
+
+    Matches what the per-model skip gate compares `requested_model_names`
+    against, so the preprocessor can make the same decision one step earlier.
+    """
+    names = set()
+    for group in model_groups:
+        for model in group or []:
+            inner = getattr(model, "model", model)
+            for attribute in ("config_name", "model_file_name"):
+                value = str(getattr(inner, attribute, "") or "").strip()
+                if value:
+                    names.add(value)
+    return names
 
 
 def _dedupe_strings(values: List[str]) -> List[str]:

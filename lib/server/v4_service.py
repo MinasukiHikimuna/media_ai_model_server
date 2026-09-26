@@ -179,7 +179,11 @@ def resolve_want_model_names(server_manager, want, default_scope):
         requested_categories.update(_normalize_string_list(getattr(item, "model_category", None)) or [])
         requested_scopes = set(_normalize_string_list(getattr(item, "scope", None)) or [])
         requested_scopes.update(_normalize_string_list(getattr(item, "scopes", None)) or [])
-        if not requested_scopes and default_scope:
+        # default_scope is a convenience for a bare want item ("run video
+        # tagging"), not a filter that should silently veto an explicit ask.
+        # A request for {capability: temporal_segmentation} on a video must
+        # still reach asset-scope models, which no frame-scope default matches.
+        if not requested_scopes and default_scope and not (requested_capabilities or requested_categories):
             requested_scopes.add(default_scope)
 
         matched = []

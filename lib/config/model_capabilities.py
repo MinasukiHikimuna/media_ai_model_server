@@ -180,6 +180,8 @@ class ModelCapabilitiesConfig:
             self._validate_reference_value(raw_entry.get("detector_models", []), allow_all=False)
             if "audio_models" in raw_entry:
                 self._validate_reference_value(raw_entry.get("audio_models"), allow_all=True)
+            if "asset_models" in raw_entry:
+                self._validate_reference_value(raw_entry.get("asset_models"), allow_all=True)
             self._validate_region_models(pipeline_name, raw_entry.get("region_models", {}) or {})
 
     def resolve_full_image_model_names_for_validation(self, pipeline_name: str) -> List[str]:
@@ -232,6 +234,12 @@ class ModelCapabilitiesConfig:
                 return None
             resolved = self._resolve_audio_model_names(audio_models, available_models)
             return resolved
+
+        if stage_name == "asset":
+            asset_models = entry.get("asset_models", None)
+            if asset_models is None:
+                return None
+            return self._resolve_asset_model_names(asset_models, available_models)
 
         return None
 
@@ -343,6 +351,27 @@ class ModelCapabilitiesConfig:
     _FULL_IMAGE_CAPABILITIES = {"tagging", "embedding"}
 
     _AUDIO_CAPABILITIES = {"embedding", "classification"}
+    _ASSET_CAPABILITIES = {"temporal_segmentation"}
+
+    def _resolve_asset_model_names(self, raw_value: Any, available_models: Optional[Sequence[Any]]) -> List[str]:
+        if _is_all_token(raw_value) or _is_all_config(raw_value):
+            return self._resolve_all_asset_model_names(available_models)
+        return self._resolve_reference_names(raw_value, available_models)
+
+    def _resolve_all_asset_model_names(self, available_models: Optional[Sequence[Any]]) -> List[str]:
+        if not available_models:
+            return []
+
+        resolved = []
+        for model in available_models:
+            model_name = _get_model_config_name(model)
+            if not model_name:
+                continue
+            capabilities = set(_get_model_values(model, "model_capabilities"))
+            scopes = set(_get_model_values(model, "supported_target_scopes"))
+            if "asset" in scopes and (capabilities & self._ASSET_CAPABILITIES):
+                resolved.append(model_name)
+        return resolved
 
     def _resolve_audio_model_names(self, raw_value: Any, available_models: Optional[Sequence[Any]]) -> List[str]:
         if _is_all_token(raw_value):
