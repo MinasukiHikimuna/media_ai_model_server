@@ -1203,6 +1203,8 @@ def preprocess_video_mp_pyav(
     dense_sinks=None,
     dense_crop=None,
     emit_interval=True,
+    dense_backend="pyav",
+    dense_quality="fast",
     **_kwargs,
 ):
     """TRUE per-interval sampling via parallel PyAV decode in worker *processes*.
@@ -1233,6 +1235,12 @@ def preprocess_video_mp_pyav(
     When the decode cannot deliver every frame, for example because the video
     is damaged, the dense streams fail and the interval frames keep coming: the
     analyses that sample frames do not depend on every one of them.
+
+    ``dense_backend`` ``"ffmpeg_cuda"`` decodes the dense frames with NVDEC in
+    one ffmpeg per size, alongside the interval workers, which then decode for
+    the interval frames only; see :func:`_open_gpu_dense_sources`. A source
+    NVDEC cannot take is decoded as with ``"pyav"``. ``dense_quality`` is the
+    ffmpeg_pipe scale quality.
     """
     from lib.model.dense_frames import DenseStreamError
     from lib.model.preprocessing_python.mp_decode import iter_parallel_frames
@@ -1255,6 +1263,19 @@ def preprocess_video_mp_pyav(
     _mdle = int(max_decode_long_edge) if max_decode_long_edge else 0
 
     dense_sinks = list(dense_sinks or [])
+    gpu_sources = _open_gpu_dense_sources(video_path, dense_sinks, dense_crop, dense_backend, dense_quality)
+    if gpu_sources:
+        yield from _preprocess_with_gpu_dense(
+            video_path, gpu_sources, dense_sinks, emit_interval,
+            lambda: iter_parallel_frames(
+                video_path, frame_interval, _mdle, int(decode_workers), use_timestamps,
+                skip_nonref=bool(skip_nonref),
+                decode_threads_per_worker=decode_threads_per_worker,
+            ),
+            lambda frame_np: _prepare_frame(frame_np, device, vr_video, frame_transforms),
+        )
+        return
+
     streams = [stream for _size, sink_streams in dense_sinks for stream in sink_streams]
     segment_counts = {}
     dense_failure = []
@@ -1303,3 +1324,91 @@ def preprocess_video_mp_pyav(
     counts = [segment_counts[segment] for segment in sorted(segment_counts)]
     for stream in streams:
         stream.finish(counts)
+
+
+def _open_gpu_dense_sources(video_path, dense_sinks, dense_crop, backend, quality):
+    """One opened NVDEC ``FrameSource`` per dense size, or None to decode on the CPU.
+
+    Every check, a two-frame smoke test included, runs before anything is
+    decoded, so a source NVDEC cannot take falls back to the CPU decode whole.
+    A cropped (VR) source is one of them: the crop would need the full frame
+    downloaded first.
+    """
+    if not dense_sinks or str(backend or "pyav").lower() != "ffmpeg_cuda":
+        return None
+    from lib.model.preprocessing_python import ffmpeg_pipe
+
+    if dense_crop:
+        _LOGGER.info("Decoding every frame of '%s' on the CPU: NVDEC does not take a cropped source", video_path)
+        return None
+    try:
+        info = ffmpeg_pipe.probe_video(video_path)
+        return [
+            ffmpeg_pipe.make_video_frame_source(
+                video_path, decode_size=size, backend="ffmpeg_cuda", quality=quality, info=info, fallback=False)
+            for size, _streams in dense_sinks
+        ]
+    except Exception as exc:  # noqa: BLE001 - any failure here means "use the CPU"
+        _LOGGER.info("Decoding every frame of '%s' on the CPU: NVDEC is unavailable: %s", video_path, exc)
+        return None
+
+
+def _preprocess_with_gpu_dense(video_path, sources, dense_sinks, emit_interval, interval_frames, prepare):
+    """Feed the dense streams from NVDEC while the interval frames decode on the CPU.
+
+    Each size's frames go to its streams as one segment, the whole video, from
+    a thread of its own. The interval frames are yielded as they come; this
+    returns once both decodes are done, like the CPU decode does.
+    """
+    from lib.model.dense_frames import DenseStreamError
+    from lib.model.preprocessing_python.mp_decode import DENSE_CLIP_FRAMES
+
+    stop = threading.Event()
+
+    def deliver(source, streams):
+        for stream in streams:
+            stream.backend_name = source.backend_name
+        clip = []
+        frames = iter(source)
+        try:
+            for _index, frame in frames:
+                if stop.is_set():
+                    raise RuntimeError("the decode was stopped early")
+                clip.append(frame)
+                if len(clip) >= DENSE_CLIP_FRAMES:
+                    if not any([stream.put(0, np.stack(clip)) for stream in streams]):
+                        return  # nobody is reading any more
+                    clip = []
+            if clip:
+                for stream in streams:
+                    stream.put(0, np.stack(clip))
+            for stream in streams:
+                stream.finish([source.frames_emitted])
+        except BaseException as exc:  # noqa: BLE001 - handed to the readers
+            _LOGGER.warning("Every-frame decode of '%s' failed; interval frames continue: %s", video_path, exc)
+            failure = DenseStreamError(f"cannot decode every frame of '{video_path}': {exc}")
+            for stream in streams:
+                stream.fail(failure)
+        finally:
+            frames.close()  # stops ffmpeg when the decode ends early
+
+    _LOGGER.info(
+        "Decoding every frame of '%s' with %s at %s",
+        video_path, sources[0].backend_name, ", ".join(f"{s.width}x{s.height}" for s in sources),
+    )
+    threads = [
+        threading.Thread(target=deliver, args=(source, streams), name="dense-gpu-decode", daemon=True)
+        for source, (_size, streams) in zip(sources, dense_sinks)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        if emit_interval:
+            for out_idx, frame_np in interval_frames():
+                yield (out_idx, prepare(frame_np))
+    except BaseException:
+        stop.set()
+        raise
+    finally:
+        for thread in threads:
+            thread.join()

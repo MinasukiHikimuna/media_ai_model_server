@@ -22,22 +22,27 @@ def _chain(info=UHD, target=(128, 96), hw=True, quality="exact", frame_step=1):
 
 # ── scale planning ───────────────────────────────────────────────────────
 
-def test_pyramid_never_exceeds_two_times_per_step():
-    """scale_cuda has a fixed kernel with no ratio-adaptive widening, so a big
-    single-step reduction aliases. Every step must stay within 2x."""
-    plan = fp.plan_scale(3840, 2160, (128, 96))
-    sizes = [(3840, 2160), *plan.gpu_steps]
-    for (prev_w, prev_h), (next_w, next_h) in zip(sizes, sizes[1:]):
-        assert prev_w / next_w <= 2.0 + 1e-9
-        assert prev_h / next_h <= 2.0 + 1e-9
-    last_w, last_h = plan.gpu_steps[-1]
-    assert last_w / 128 <= 2.0 and last_h / 96 <= 2.0
+def test_exact_quality_scales_on_the_cpu_only():
+    """scale_cuda shifts the colours with every step, so the exact plan leaves
+    all of the scaling to swscale, as the software path does."""
+    plan = fp.plan_scale(7680, 4320, (128, 96))
+    assert plan.gpu_steps == () and plan.target == (128, 96)
 
 
-def test_pyramid_preserves_aspect_ratio():
-    plan = fp.plan_scale(3840, 2160, (128, 96))
-    for width, height in plan.gpu_steps:
-        assert abs((width / height) - (3840 / 2160)) < 0.02
+def test_fast_quality_shrinks_large_sources_once_by_a_power_of_two():
+    assert fp.plan_scale(7680, 4320, (128, 96), "fast").gpu_steps == ((1920, 1080),)
+    assert fp.plan_scale(3840, 2160, (128, 96), "fast").gpu_steps == ((1920, 1080),)
+    assert fp.plan_scale(5760, 2880, (128, 96), "fast").gpu_steps == ((1440, 720),)
+
+
+def test_fast_quality_leaves_small_sources_to_the_cpu():
+    assert fp.plan_scale(1920, 1080, (128, 96), "fast").gpu_steps == ()
+    assert fp.plan_scale(640, 360, (128, 96), "fast").gpu_steps == ()
+
+
+def test_fast_quality_never_shrinks_below_the_target():
+    plan = fp.plan_scale(7680, 4320, (2048, 1536), "fast")
+    assert plan.gpu_steps == ((3840, 2160),)
 
 
 def test_no_plan_when_already_at_target_or_unset():
@@ -45,23 +50,32 @@ def test_no_plan_when_already_at_target_or_unset():
     assert fp.plan_scale(3840, 2160, None).is_noop
 
 
-def test_fast_quality_skips_the_pyramid():
-    assert fp.plan_scale(3840, 2160, (128, 96), "fast").gpu_steps == ()
-
-
 # ── filter chain ─────────────────────────────────────────────────────────
 
-def test_gpu_scaling_happens_before_the_download():
-    """The whole point: shrink on the GPU so tiny frames cross PCIe."""
-    chain = _chain()
-    assert chain.index("scale_cuda") < chain.index("hwdownload")
+def test_fast_gpu_scaling_happens_before_the_download():
+    """Shrink on the GPU so less crosses PCIe, and let swscale take the last step."""
+    chain = _chain(quality="fast")
+    assert chain.index("scale_cuda") < chain.index("hwdownload") < chain.index("scale=128:96")
 
 
-def test_final_gpu_step_converts_pixel_format():
+def test_gpu_scaling_uses_the_ratio_adaptive_filters_and_converts_to_nv12():
     """10-bit sources arrive as p010le; `hwdownload,format=nv12` alone fails."""
-    steps = [s for s in _chain().split(",") if s.startswith("scale_cuda")]
-    assert "format=nv12" in steps[-1]
-    assert all("format=nv12" not in step for step in steps[:-1])
+    step = _chain(quality="fast").split(",")[0]
+    assert step.startswith("scale_cuda=") and "use_filters=1" in step and "format=nv12" in step
+
+
+def test_exact_chain_downloads_in_the_decoders_format():
+    """A no-op scale_cuda to convert would copy every full-size frame; the
+    download names the format NVDEC produced instead."""
+    assert _chain() == "hwdownload,format=nv12,scale=128:96:flags=bicubic"
+    plan = fp.plan_scale(3840, 2160, (128, 96))
+    assert fp.build_filter_chain(plan, 1, True, ten_bit=True) == \
+        "hwdownload,format=p010le,scale=128:96:flags=bicubic"
+
+
+def test_a_reduced_ten_bit_frame_comes_down_as_nv12():
+    plan = fp.plan_scale(3840, 2160, (128, 96), "fast")
+    assert "format=p010le" not in fp.build_filter_chain(plan, 1, True, ten_bit=True)
 
 
 def test_chain_uses_literal_integers_not_expressions():
@@ -70,7 +84,7 @@ def test_chain_uses_literal_integers_not_expressions():
 
 def test_frame_step_uses_select_not_the_fps_filter():
     """`fps=` resamples to a wall-clock rate and changes the frame count."""
-    chain = _chain(frame_step=4)
+    chain = _chain(frame_step=4, quality="fast")
     assert "select=" in chain
     assert "fps=" not in chain
     assert chain.index("select=") < chain.index("scale_cuda")

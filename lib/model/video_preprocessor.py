@@ -182,6 +182,11 @@ class VideoPreprocessorModel(Model):
         # Every-frame decodes running at once across the server; the rest wait.
         _dense_limit = configValues.get("max_concurrent_dense_decodes", 1)
         self._dense_decode_slots = dense_decode_slots(1 if _dense_limit is None else int(_dense_limit))
+        # What decodes every frame for those decodes: "pyav", the interval
+        # decode workers, or "ffmpeg_cuda", NVDEC beside them, which then decode
+        # for the interval frames only. A source NVDEC cannot take uses "pyav".
+        self._dense_decode_backend = str(configValues.get("dense_decode_backend", "pyav") or "pyav").lower()
+        self._dense_decode_quality = str(configValues.get("dense_decode_quality", "fast") or "fast").lower()
 
         # How many frames to resize/normalize per batched GPU call.  Larger =
         # fewer GIL-held dispatches (better decode/inference overlap) at the cost
@@ -370,9 +375,12 @@ class VideoPreprocessorModel(Model):
                         preprocess_video_mp_pyav,
                         decode_workers=self._decode_workers,
                         decode_threads_per_worker=self._decode_threads_per_worker,
+                        skip_nonref=self._skip_nonref,
                         dense_sinks=dense_sinks,
                         dense_crop=dense_crop,
                         emit_interval=frames_wanted,
+                        dense_backend=self._dense_decode_backend,
+                        dense_quality=self._dense_decode_quality,
                     )
                     backend_used = "mp_pyav"
                     self.logger.info(

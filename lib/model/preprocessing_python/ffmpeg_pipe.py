@@ -21,11 +21,11 @@ Two properties are load-bearing and easy to get wrong:
   index to time as ``index / fps``, so a dropped or duplicated frame shifts
   every timestamp after it. Hence ``-fps_mode passthrough`` and a ``select``
   frame modulo — never the ``fps`` filter, which resamples to a wall-clock rate.
-* **Scaling must not alias.** ``scale_cuda`` uses a fixed 4x4 kernel with no
-  ratio-adaptive widening, unlike swscale's bicubic. Reducing 3840x2160 to
-  128x96 in one GPU step samples ~4 of every 30x22 source pixels. So we halve on
-  the GPU until within 2x of the target and take the last step with swscale,
-  which is what a reference software pipeline would have produced.
+* **Scaling must match the software path.** ``scale_cuda`` shifts the colours
+  a little with every step (about one level of red and blue on real footage),
+  and with its fixed kernels a large reduction aliases. So the step to the
+  model's size is always swscale's, as in the software path, and the GPU at
+  most shrinks the frame once beforehand; see :func:`plan_scale`.
 """
 
 import logging
@@ -97,9 +97,9 @@ class FFmpegFeatures:
 class ScalePlan:
     """How to get from the source geometry to an exact target size.
 
-    ``gpu_steps`` are aspect-preserving halvings applied with ``scale_cuda``;
-    ``target`` is the exact output size, reached by one last, small,
-    aspect-breaking step with swscale (or on the GPU when there is no halving).
+    ``gpu_steps`` are aspect-preserving reductions applied with ``scale_cuda``
+    before the download; ``target`` is the exact output size, always reached
+    by swscale after it.
     ``crop`` is an ``(x, y, width, height)`` region of the source taken before
     any scaling, e.g. one eye of a VR frame; the plan is made from its size.
     """
@@ -244,6 +244,11 @@ def _enum_name(value, names: dict):
     return text or None
 
 
+def _is_ten_bit(pix_fmt: str) -> bool:
+    """Whether NVDEC hands this source over as p010le rather than nv12."""
+    return "10le" in pix_fmt or "10be" in pix_fmt or pix_fmt.startswith("p010")
+
+
 def nvdec_supports(info: VideoInfo) -> tuple:
     """Whether NVDEC can be expected to decode this source."""
     if info.codec and info.codec.lower() not in _NVDEC_CODECS:
@@ -262,6 +267,10 @@ def nvdec_supports(info: VideoInfo) -> tuple:
 
 # ── planning ─────────────────────────────────────────────────────────────
 
+# ``quality="fast"`` shrinks larger sources on the GPU to at most this long edge.
+FAST_MAX_DOWNLOAD_LONG_EDGE = 1920
+
+
 def _even_up(value: int) -> int:
     """Round up to the next even number; ffmpeg filters dislike odd dimensions."""
     return (value + 1) & ~1
@@ -271,9 +280,15 @@ def plan_scale(src_width: int, src_height: int, decode_size, quality: str = "exa
                crop: Optional[tuple] = None) -> ScalePlan:
     """Plan the descent from the source geometry to an exact target size.
 
-    ``quality="exact"`` halves on the GPU until within 2x of the target so the
-    final swscale step matches a pure software pipeline. ``quality="fast"``
-    goes straight there in one GPU step, which is quicker and aliases.
+    ``quality="exact"`` downloads every frame at the source size and scales it
+    with swscale alone, so NVDEC hands over the same frames as a software
+    decode. At 8K the download caps NVDEC at about 108 fps.
+    ``quality="fast"`` first shrinks a source larger than
+    ``FAST_MAX_DOWNLOAD_LONG_EDGE`` on the GPU, by a power of two in one
+    ``scale_cuda`` step with its generic filters, so less crosses PCIe. On an
+    8K HEVC source that is about 148 fps, and the frames differ from a
+    software decode by 1.5 levels on average; a shot-boundary model found the
+    same 54 cuts in 10 minutes of it, one of them a frame later.
     With ``crop``, the cropped region is what gets scaled.
     """
     crop = tuple(int(value) for value in crop) if crop else None
@@ -288,25 +303,20 @@ def plan_scale(src_width: int, src_height: int, decode_size, quality: str = "exa
     if (src_width, src_height) == (target_width, target_height):
         return ScalePlan(target=None, crop=crop)
 
-    if quality == "fast":
-        return ScalePlan(target=(target_width, target_height), crop=crop)
+    target = (target_width, target_height)
+    if quality != "fast":
+        return ScalePlan(target=target, crop=crop)
 
-    steps = []
-    width, height = src_width, src_height
-    # Halve while either axis is still more than 2x the target. Halving keeps
-    # the aspect ratio, so scale_cuda's fixed kernel stays adequate; the final
-    # aspect-breaking step is left to swscale.
-    while width > 2 * target_width or height > 2 * target_height:
-        # Round the half UP to an even number. Rounding down can push a step
-        # past 2x (270 -> 134 is 2.014x), which is exactly what the pyramid
-        # exists to avoid.
-        width = max(2, _even_up((width + 1) // 2))
-        height = max(2, _even_up((height + 1) // 2))
-        steps.append((width, height))
-        if width <= target_width and height <= target_height:
-            break
-
-    return ScalePlan(target=(target_width, target_height), gpu_steps=tuple(steps), crop=crop)
+    divisor = 1
+    while max(src_width, src_height) / divisor > FAST_MAX_DOWNLOAD_LONG_EDGE:
+        divisor *= 2
+    # Never below the target: swscale would then be enlarging.
+    while divisor > 1 and (src_width / divisor < target_width or src_height / divisor < target_height):
+        divisor //= 2
+    if divisor == 1:
+        return ScalePlan(target=target, crop=crop)
+    step = (max(2, _even_up(src_width // divisor)), max(2, _even_up(src_height // divisor)))
+    return ScalePlan(target=target, gpu_steps=(step,), crop=crop)
 
 
 def vr_crop_rect(width: int, height: int) -> tuple:
@@ -322,7 +332,7 @@ def vr_crop_rect(width: int, height: int) -> tuple:
     return (width // 4, 0, 3 * width // 4 - width // 4, height // 2)
 
 
-def build_filter_chain(plan: ScalePlan, frame_step: int, hw: bool) -> str:
+def build_filter_chain(plan: ScalePlan, frame_step: int, hw: bool, ten_bit: bool = False) -> str:
     """Build the -vf chain. Pure: no I/O, unit-tested directly."""
     parts = []
     if frame_step > 1:
@@ -341,20 +351,17 @@ def build_filter_chain(plan: ScalePlan, frame_step: int, hw: bool) -> str:
         parts.append(f"crop={width}:{height}:{x}:{y}:exact=1")
 
     if hw:
-        for index, (width, height) in enumerate(plan.gpu_steps):
-            is_last = index == len(plan.gpu_steps) - 1
-            step = f"scale_cuda={width}:{height}:interp_algo={'bicubic' if is_last else 'bilinear'}"
-            if is_last:
-                # Convert on the GPU so 10-bit sources (p010le) survive the
-                # download, which `hwdownload,format=nv12` alone cannot do.
-                step += ":format=nv12"
-            parts.append(step)
-        if not plan.gpu_steps and not plan.is_noop:
-            width, height = plan.target
-            parts.append(f"scale_cuda={width}:{height}:interp_algo=bicubic:format=nv12")
+        # A reduction converts to nv12 on the GPU, so 10-bit sources (p010le)
+        # come down as nv12 too. Without one, the frame is downloaded in the
+        # decoder's own format, which `ten_bit` names: hwdownload cannot
+        # convert, and a no-op scale_cuda to convert would copy the whole frame.
+        # use_filters=1: the generic filters adapt to the ratio; the fixed
+        # kernels alias on a large reduction.
+        for width, height in plan.gpu_steps:
+            parts.append(f"scale_cuda={width}:{height}:interp_algo=bilinear:use_filters=1:format=nv12")
         parts.append("hwdownload")
-        parts.append("format=nv12")
-        if plan.gpu_steps and not plan.is_noop:
+        parts.append("format=p010le" if ten_bit and not plan.gpu_steps else "format=nv12")
+        if not plan.is_noop:
             parts.append(_cpu_scale(plan.target))
     elif not plan.is_noop:
         parts.append(_cpu_scale(plan.target))
@@ -570,6 +577,7 @@ def make_video_frame_source(
     device_index: Optional[int] = None,
     info: Optional[VideoInfo] = None,
     crop: Optional[tuple] = None,
+    fallback: bool = True,
 ) -> FrameSource:
     """Open the fastest usable decode for this source.
 
@@ -577,6 +585,7 @@ def make_video_frame_source(
     only when asked for). Every check runs before a single frame is produced,
     so a failure here is recoverable.
     ``crop`` (x, y, width, height) is applied to the source before scaling.
+    ``fallback`` False tries ``backend`` alone and raises when it is unusable.
     """
     info = info or probe_video(video_path)
     plan = plan_scale(info.width, info.height, decode_size, quality, crop=crop)
@@ -587,10 +596,12 @@ def make_video_frame_source(
     else:
         width, height = info.width, info.height
 
-    for rung in _ladder(backend):
+    for rung in _ladder(backend) if fallback else [backend]:
         try:
             return _open(rung, video_path, info, plan, frame_step, width, height, device_index)
         except DecodeSetupError as exception:
+            if not fallback:
+                raise
             logger.info(f"Decode backend {rung} unavailable for this source: {exception}")
 
     raise DecodeSetupError(f"No usable decode backend for {video_path}")
@@ -649,7 +660,7 @@ def _open(rung, video_path, info, plan, frame_step, width, height, device_index)
         if not supported:
             raise DecodeSetupError(reason)
 
-    chain = build_filter_chain(plan, frame_step, hw)
+    chain = build_filter_chain(plan, frame_step, hw, ten_bit=_is_ten_bit(info.pix_fmt))
     command = build_command(
         features.path, video_path, chain, hw, features.has_fps_mode, device_index
     )
