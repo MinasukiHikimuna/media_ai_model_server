@@ -33,6 +33,8 @@ _DEFFCODE_LOG_SUPPRESSIONS = (
 _DEFFCODE_LOG_FILTER = None
 _DEFFCODE_DECODER = None
 _LOGGER = logging.getLogger(__name__)
+# The server's own log, for what an operator should see: which decoder a video got.
+_SERVER_LOGGER = logging.getLogger("logger")
 
 
 # libav decode errors that are transient when seeking: a seek can land mid-GOP
@@ -1339,7 +1341,7 @@ def _open_gpu_dense_sources(video_path, dense_sinks, dense_crop, backend, qualit
     from lib.model.preprocessing_python import ffmpeg_pipe
 
     if dense_crop:
-        _LOGGER.info("Decoding every frame of '%s' on the CPU: NVDEC does not take a cropped source", video_path)
+        _SERVER_LOGGER.info("Decoding every frame of '%s' on the CPU: NVDEC does not take a cropped source", video_path)
         return None
     try:
         info = ffmpeg_pipe.probe_video(video_path)
@@ -1349,7 +1351,7 @@ def _open_gpu_dense_sources(video_path, dense_sinks, dense_crop, backend, qualit
             for size, _streams in dense_sinks
         ]
     except Exception as exc:  # noqa: BLE001 - any failure here means "use the CPU"
-        _LOGGER.info("Decoding every frame of '%s' on the CPU: NVDEC is unavailable: %s", video_path, exc)
+        _SERVER_LOGGER.info("Decoding every frame of '%s' on the CPU: NVDEC is unavailable: %s", video_path, exc)
         return None
 
 
@@ -1385,14 +1387,14 @@ def _preprocess_with_gpu_dense(video_path, sources, dense_sinks, emit_interval, 
             for stream in streams:
                 stream.finish([source.frames_emitted])
         except BaseException as exc:  # noqa: BLE001 - handed to the readers
-            _LOGGER.warning("Every-frame decode of '%s' failed; interval frames continue: %s", video_path, exc)
+            _SERVER_LOGGER.warning("Every-frame decode of '%s' failed; interval frames continue: %s", video_path, exc)
             failure = DenseStreamError(f"cannot decode every frame of '{video_path}': {exc}")
             for stream in streams:
                 stream.fail(failure)
         finally:
             frames.close()  # stops ffmpeg when the decode ends early
 
-    _LOGGER.info(
+    _SERVER_LOGGER.info(
         "Decoding every frame of '%s' with %s at %s",
         video_path, sources[0].backend_name, ", ".join(f"{s.width}x{s.height}" for s in sources),
     )
