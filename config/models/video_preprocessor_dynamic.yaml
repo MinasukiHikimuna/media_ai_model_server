@@ -11,5 +11,10 @@ gpu_min_long_edge: 36000            # deffcode_auto: use GPU when video long edg
 decode_workers: 0                   # ffmpeg_parallel: parallel ffmpeg decode processes for true-interval sampling (0 = auto: min(8, cpu_count))
 decode_threads_per_worker: 0        # decoder threads in each decode worker (0 = auto: cpu_count // decode_workers, at most 8)
 max_concurrent_dense_decodes: 1     # every-frame decodes (shot boundaries) running at once across the server; others wait (0 = no limit)
-dense_decode_backend: pyav          # every-frame decodes: pyav (CPU, in the decode workers) or ffmpeg_cuda (NVDEC beside them; falls back to pyav)
+dense_decode_backend: auto          # every-frame decodes: pyav (CPU, in the decode workers), ffmpeg_cuda (NVDEC beside them; falls back to pyav), or auto
+# auto: NVDEC for a source whose long edge is at least its codec's here; other codecs on the CPU.
+# NVDEC decodes 150-600 fps beside the interval decode, so it wins only where the CPU is slower:
+# HEVC above 4K (5.5K 2.45x, 8K 2.8x; 4K was 13% slower) and AV1 at 4K (1.65-2.1x; 1080p even).
+# H.264 (1080p, 4K) and VP9 (1080p) were 1.2-1.5x slower on NVDEC.
+dense_decode_gpu_min_long_edge: {hevc: 5000, av1: 2560}
 dense_decode_quality: fast          # ffmpeg_cuda: fast (shrink sources over 1920 on the GPU) or exact (same frames as pyav, slower at 8K); see ffmpeg_pipe.plan_scale

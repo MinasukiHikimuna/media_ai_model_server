@@ -1207,6 +1207,7 @@ def preprocess_video_mp_pyav(
     emit_interval=True,
     dense_backend="pyav",
     dense_quality="fast",
+    dense_gpu_min_long_edge=None,
     **_kwargs,
 ):
     """TRUE per-interval sampling via parallel PyAV decode in worker *processes*.
@@ -1241,8 +1242,12 @@ def preprocess_video_mp_pyav(
     ``dense_backend`` ``"ffmpeg_cuda"`` decodes the dense frames with NVDEC in
     one ffmpeg per size, alongside the interval workers, which then decode for
     the interval frames only; see :func:`_open_gpu_dense_sources`. A source
-    NVDEC cannot take is decoded as with ``"pyav"``. ``dense_quality`` is the
-    ffmpeg_pipe scale quality.
+    NVDEC cannot take is decoded as with ``"pyav"``. ``"auto"`` uses NVDEC
+    only for a source whose long edge is at least ``dense_gpu_min_long_edge``
+    for its codec, ``{codec: long_edge}``; a codec not listed is decoded on
+    the CPU. NVDEC's one engine decodes 150-600 fps whatever the codec, so it
+    wins only where the CPU decodes slower than that. ``dense_quality`` is
+    the ffmpeg_pipe scale quality.
     """
     from lib.model.dense_frames import DenseStreamError
     from lib.model.preprocessing_python.mp_decode import iter_parallel_frames
@@ -1265,7 +1270,8 @@ def preprocess_video_mp_pyav(
     _mdle = int(max_decode_long_edge) if max_decode_long_edge else 0
 
     dense_sinks = list(dense_sinks or [])
-    gpu_sources = _open_gpu_dense_sources(video_path, dense_sinks, dense_crop, dense_backend, dense_quality)
+    gpu_sources = _open_gpu_dense_sources(
+        video_path, dense_sinks, dense_crop, dense_backend, dense_quality, dense_gpu_min_long_edge)
     if gpu_sources:
         yield from _preprocess_with_gpu_dense(
             video_path, gpu_sources, dense_sinks, emit_interval,
@@ -1328,15 +1334,18 @@ def preprocess_video_mp_pyav(
         stream.finish(counts)
 
 
-def _open_gpu_dense_sources(video_path, dense_sinks, dense_crop, backend, quality):
+def _open_gpu_dense_sources(video_path, dense_sinks, dense_crop, backend, quality, min_long_edge=None):
     """One opened NVDEC ``FrameSource`` per dense size, or None to decode on the CPU.
 
     Every check, a two-frame smoke test included, runs before anything is
     decoded, so a source NVDEC cannot take falls back to the CPU decode whole.
     A cropped (VR) source is one of them: the crop would need the full frame
-    downloaded first.
+    downloaded first. With ``backend`` ``"auto"``, so is a source whose codec
+    is not in ``min_long_edge``, ``{codec: long_edge}``, or whose long edge is
+    under its codec's.
     """
-    if not dense_sinks or str(backend or "pyav").lower() != "ffmpeg_cuda":
+    backend = str(backend or "pyav").lower()
+    if not dense_sinks or backend not in ("ffmpeg_cuda", "auto"):
         return None
     from lib.model.preprocessing_python import ffmpeg_pipe
 
@@ -1345,6 +1354,18 @@ def _open_gpu_dense_sources(video_path, dense_sinks, dense_crop, backend, qualit
         return None
     try:
         info = ffmpeg_pipe.probe_video(video_path)
+        long_edge = max(info.width, info.height)
+        codec = str(info.codec).lower()
+        threshold = (min_long_edge or {}).get(codec)
+        if backend == "auto" and threshold is None:
+            _SERVER_LOGGER.info(
+                "Decoding every frame of '%s' on the CPU: the CPU decodes %s faster than NVDEC", video_path, codec)
+            return None
+        if backend == "auto" and long_edge < threshold:
+            _SERVER_LOGGER.info(
+                "Decoding every frame of '%s' on the CPU: the CPU decodes %s faster than NVDEC under %d, and its long edge is %d",
+                video_path, codec, threshold, long_edge)
+            return None
         return [
             ffmpeg_pipe.make_video_frame_source(
                 video_path, decode_size=size, backend="ffmpeg_cuda", quality=quality, info=info, fallback=False)

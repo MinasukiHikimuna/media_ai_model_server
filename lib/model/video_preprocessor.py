@@ -206,7 +206,13 @@ class VideoPreprocessorModel(Model):
         # What decodes every frame for those decodes: "pyav", the interval
         # decode workers, or "ffmpeg_cuda", NVDEC beside them, which then decode
         # for the interval frames only. A source NVDEC cannot take uses "pyav".
+        # "auto" is "ffmpeg_cuda" for a source whose long edge is at least
+        # dense_decode_gpu_min_long_edge[its codec], and "pyav" for the rest,
+        # codecs not listed included.
         self._dense_decode_backend = str(configValues.get("dense_decode_backend", "pyav") or "pyav").lower()
+        _gpu_min_long_edge = configValues.get("dense_decode_gpu_min_long_edge", {"hevc": 5000, "av1": 2560})
+        self._dense_decode_gpu_min_long_edge = {
+            str(codec).lower(): int(edge) for codec, edge in (_gpu_min_long_edge or {}).items()}
         self._dense_decode_quality = str(configValues.get("dense_decode_quality", "fast") or "fast").lower()
 
         # How many frames to resize/normalize per batched GPU call.  Larger =
@@ -402,6 +408,7 @@ class VideoPreprocessorModel(Model):
                         emit_interval=frames_wanted,
                         dense_backend=self._dense_decode_backend,
                         dense_quality=self._dense_decode_quality,
+                        dense_gpu_min_long_edge=self._dense_decode_gpu_min_long_edge,
                     )
                     backend_used = "mp_pyav"
                     self.logger.info(

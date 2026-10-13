@@ -131,7 +131,7 @@ def test_a_reader_that_stops_reading_stops_the_gpu_decode():
 
 def test_the_cpu_decodes_every_frame_unless_nvdec_is_asked_for(monkeypatch):
     opened = []
-    monkeypatch.setattr(ffmpeg_pipe, "probe_video", lambda path: "info")
+    _probe_as(monkeypatch, 640, 360)
     monkeypatch.setattr(ffmpeg_pipe, "make_video_frame_source",
                         lambda *args, **kwargs: opened.append(kwargs) or _Source(1))
     sinks = [(SIZE, [object()])]
@@ -143,6 +143,52 @@ def test_the_cpu_decodes_every_frame_unless_nvdec_is_asked_for(monkeypatch):
     sources = ip._open_gpu_dense_sources("clip.mp4", sinks, None, "ffmpeg_cuda", "exact")
     assert len(sources) == 1
     assert opened[0]["backend"] == "ffmpeg_cuda" and opened[0]["fallback"] is False
+
+
+def _probe_as(monkeypatch, width, height, codec="hevc"):
+    info = ffmpeg_pipe.VideoInfo(width, height, "yuv420p", codec, 60.0, 10.0, 600, "progressive", None, None)
+    monkeypatch.setattr(ffmpeg_pipe, "probe_video", lambda path: info)
+
+
+THRESHOLDS = {"hevc": 5000, "av1": 2560}
+
+
+def _auto(monkeypatch, width, height, codec):
+    _probe_as(monkeypatch, width, height, codec)
+    monkeypatch.setattr(ffmpeg_pipe, "make_video_frame_source", lambda *args, **kwargs: _Source(1))
+    sources = ip._open_gpu_dense_sources("clip.mp4", [(SIZE, [object()])], None, "auto", "fast", THRESHOLDS)
+    return "nvdec" if sources else "cpu"
+
+
+@pytest.mark.parametrize("width, height, codec, decoder", [
+    (7680, 4320, "hevc", "nvdec"),
+    (5568, 3132, "hevc", "nvdec"),
+    (3840, 2160, "hevc", "cpu"),
+    (1920, 1080, "hevc", "cpu"),
+    (3840, 2160, "av1", "nvdec"),
+    (1920, 1080, "av1", "cpu"),
+    (3840, 2160, "h264", "cpu"),
+    (7680, 4320, "h264", "cpu"),
+    (1920, 1080, "vp9", "cpu"),
+    (3132, 5568, "hevc", "nvdec"),
+])
+def test_auto_decodes_on_nvdec_only_where_it_beats_the_cpu(monkeypatch, width, height, codec, decoder):
+    assert _auto(monkeypatch, width, height, codec) == decoder
+
+
+def test_auto_without_thresholds_decodes_on_the_cpu(monkeypatch):
+    _probe_as(monkeypatch, 7680, 4320, "hevc")
+    monkeypatch.setattr(ffmpeg_pipe, "make_video_frame_source",
+                        lambda *args, **kwargs: pytest.fail("NVDEC was tried without a threshold"))
+
+    assert ip._open_gpu_dense_sources("clip.mp4", [(SIZE, [object()])], None, "auto", "fast", None) is None
+
+
+def test_ffmpeg_cuda_ignores_the_thresholds(monkeypatch):
+    _probe_as(monkeypatch, 640, 480, codec="h264")
+    monkeypatch.setattr(ffmpeg_pipe, "make_video_frame_source", lambda *args, **kwargs: _Source(1))
+
+    assert ip._open_gpu_dense_sources("clip.mp4", [(SIZE, [object()])], None, "ffmpeg_cuda", "fast", THRESHOLDS)
 
 
 def test_a_cropped_source_is_decoded_on_the_cpu(monkeypatch):
@@ -157,7 +203,7 @@ def test_a_source_nvdec_cannot_take_is_decoded_on_the_cpu(monkeypatch):
     def refuse(*args, **kwargs):
         raise ffmpeg_pipe.DecodeSetupError("pixel format yuv444p is not supported by NVDEC")
 
-    monkeypatch.setattr(ffmpeg_pipe, "probe_video", lambda path: "info")
+    _probe_as(monkeypatch, 640, 360)
     monkeypatch.setattr(ffmpeg_pipe, "make_video_frame_source", refuse)
 
     assert ip._open_gpu_dense_sources("clip.mp4", [(SIZE, [object()])], None, "ffmpeg_cuda", "exact") is None
