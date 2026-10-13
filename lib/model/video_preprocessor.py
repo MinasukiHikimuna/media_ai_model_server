@@ -584,22 +584,29 @@ class VideoPreprocessorModel(Model):
                         raws = torch.stack([rf for _, rf in _batch], dim=0)  # [N,C,H,W]
                         spec_batches = [apply_spec_batch(raws, sp) for sp in _specs]
                         del raws
-                        indices = [fidx for fidx, _ in _batch]
+                        # Each frame gets its own copy rather than a view into
+                        # the batch, so its memory is freed when it is done (the
+                        # region source as soon as no face needs it) instead of
+                        # when the slowest frame of its batch is.
+                        frames = [
+                            (fidx, {
+                                _spec_names[si]: spec_batches[si][bi].clone()
+                                for si in range(len(_specs))
+                            })
+                            for bi, (fidx, _) in enumerate(_batch)
+                        ]
+                        del spec_batches
                         _batch.clear()
                         _cumulative_cpu[0] += time.perf_counter() - t0
-                        # Every frame below is a view into its batch, so the
-                        # batch's memory lasts until its last frame is done.
                         t1 = time.perf_counter()
-                        lease = _budget.acquire(_batch_bytes(spec_batches), len(indices), _stop)
+                        lease = _budget.acquire(
+                            _batch_bytes(t for _, st in frames for t in st.values()), len(frames), _stop)
                         _budget_wait[0] += time.perf_counter() - t1
                         if lease is None:
                             return False
                         _leases.append(lease)
-                        for bi, fidx in enumerate(indices):
-                            st = {
-                                _spec_names[si]: spec_batches[si][bi]
-                                for si in range(len(_specs))
-                            }
+                        while frames:
+                            fidx, st = frames.pop(0)
                             if not _put((fidx, st, lease)):
                                 return False
                         return True

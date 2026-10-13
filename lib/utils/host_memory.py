@@ -73,43 +73,50 @@ class HostMemoryBudget:
 
 
 class BatchLease:
-    """The budget held by one batch of frames.
+    """The budget held by one batch of frames, each owning an equal share.
 
     The decode calls ``deliver`` for each frame it hands on and ``finish`` when
-    that frame is done. ``seal`` says no more frames will be handed on, so
-    frames never delivered (the decode stopped early) stop counting. ``release``
-    gives everything back at once, for a request that ended anyway. All calls
-    after the release do nothing.
+    that frame is done, which gives back the frame's share. ``seal`` says no
+    more frames will be handed on, so frames never delivered (the decode
+    stopped early) stop counting. ``release`` gives back everything left, for
+    a request that ended anyway; later calls do nothing.
     """
 
     def __init__(self, budget, nbytes, frames):
         self._budget = budget
         self.nbytes = nbytes
-        self.frames = frames
+        self.frames = max(1, int(frames))
         self.delivered = 0
         self.finished = 0
         self.sealed = False
-        self.released = False
+        self.returned = 0
+
+    @property
+    def released(self):
+        return self.returned >= self.nbytes
 
     def deliver(self):
         self.delivered += 1
 
     def finish(self):
         self.finished += 1
-        self._release_if_done()
+        self._return_up_to(self.finished)
 
     def seal(self):
         self.sealed = True
-        self._release_if_done()
+        self._return_up_to(self.frames - (self.delivered - self.finished))
 
     def release(self):
-        if not self.released:
-            self.released = True
-            self._budget.release(self.nbytes)
+        self._return_up_to(self.frames)
 
-    def _release_if_done(self):
-        if self.finished >= self.frames or (self.sealed and self.finished >= self.delivered):
-            self.release()
+    def _return_up_to(self, frames_done):
+        """Return the shares of ``frames_done`` frames in all."""
+        if self.sealed:
+            frames_done = max(frames_done, self.frames - (self.delivered - self.finished))
+        target = self.nbytes if frames_done >= self.frames else self.nbytes * frames_done // self.frames
+        if target > self.returned:
+            self._budget.release(target - self.returned)
+            self.returned = target
 
 
 _budget = None

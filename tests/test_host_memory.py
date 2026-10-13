@@ -51,15 +51,16 @@ def test_a_stopped_wait_gives_up():
     assert result == [None] and budget.in_use == 100
 
 
-def test_a_lease_is_released_once_when_its_last_frame_is_done():
+def test_each_frame_gives_back_its_share_when_done():
     budget = HostMemoryBudget(1000)
     lease = budget.acquire(300, 3)
     for _ in range(3):
         lease.deliver()
     lease.finish()
+    assert budget.in_use == 200
     lease.finish()
-    assert budget.in_use == 300
     lease.finish()
+    assert budget.in_use == 0
     lease.finish()
     lease.release()
     assert budget.in_use == 0
@@ -70,9 +71,18 @@ def test_frames_never_handed_on_stop_counting_when_the_lease_is_sealed():
     lease = budget.acquire(300, 3)
     lease.deliver()
     lease.seal()
-    assert budget.in_use == 300
+    assert budget.in_use == 100
     lease.finish()
     assert budget.in_use == 0
+
+
+def test_releasing_a_lease_gives_back_what_is_left():
+    budget = HostMemoryBudget(1000)
+    lease = budget.acquire(300, 3)
+    lease.deliver()
+    lease.finish()
+    lease.release()
+    assert budget.in_use == 0 and lease.released
 
 
 def test_no_limit_never_waits():
@@ -169,6 +179,22 @@ async def test_decoded_frames_never_hold_more_than_the_budget(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_frames_do_not_share_memory_with_their_batch(monkeypatch):
+    model = _model(monkeypatch, _Source(BATCH), HostMemoryBudget(0))
+    frames = []
+
+    async def handler(future, key):
+        if key == "frame":
+            frames.append(future["frame"])
+
+    _root, item = await _request(handler)
+    await model.worker_function([item])
+
+    assert len(frames) == BATCH
+    assert all(frame.untyped_storage().nbytes() == frame.nbytes for frame in frames)
+
+
+@pytest.mark.asyncio
 async def test_a_failed_request_stops_the_decode_and_gives_its_memory_back(monkeypatch):
     budget = HostMemoryBudget(_batch_bytes() * 4)
     source = _Source(1_000_000)
@@ -191,3 +217,31 @@ async def test_a_failed_request_stops_the_decode_and_gives_its_memory_back(monke
     assert source.emitted < 1_000_000
     assert budget.in_use == 0
     assert not any(t.name == "video-preprocess-producer" for t in threading.enumerate())
+
+
+# ---- the 8-bit region source --------------------------------------------------
+
+def test_the_region_source_is_kept_as_8_bit_rounded():
+    from lib.pipeline.preprocess_spec import apply_spec, apply_spec_batch
+
+    spec = PreprocessSpec.for_region_source(max_long_edge=64)
+    frame = torch.full((3, 36, 64), 100.6)
+    frame[0, 0, 0] = 300.0
+
+    single = apply_spec(frame, spec)
+    batch = apply_spec_batch(frame.unsqueeze(0), spec)
+    for out in (single, batch[0]):
+        assert out.dtype == torch.uint8
+        assert out[1, 1, 1] == 101 and out[0, 0, 0] == 255
+    assert spec.key.endswith("_u8_max64")
+
+
+def test_a_region_cut_from_an_8_bit_source_is_float():
+    from lib.model.python_functions import _crop_and_resize_region
+
+    source = torch.full((3, 36, 64), 200, dtype=torch.uint8)
+    crop = _crop_and_resize_region(source, [4, 2, 20, 12])
+    assert crop.dtype == torch.float32 and crop.shape == (3, 10, 16)
+    assert float(crop.max()) == 200.0
+    crop += 1
+    assert int(source.max()) == 200
