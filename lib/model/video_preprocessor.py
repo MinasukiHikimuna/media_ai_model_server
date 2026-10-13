@@ -99,6 +99,24 @@ def compute_auto_pending_frames(per_frame_mb, ram_fraction, assumed_concurrency,
     return max(_min, min(cap, _max))
 
 
+def compute_pending_frames_cap(per_frame_mb, explicit_frames, memory_gb, ram_fraction,
+                               assumed_concurrency, _floor=8):
+    """Per-video cap on in-flight preprocessed frames.
+
+    ``explicit_frames`` (> 0) pins a frame count; otherwise the cap is sized
+    from total RAM (see compute_auto_pending_frames). ``memory_gb`` (> 0) then
+    bounds the backlog's bytes as well, so large frames get a smaller cap: a
+    frame count alone lets a fast decode hold far more than the machine has.
+    """
+    if explicit_frames and explicit_frames > 0:
+        cap = int(explicit_frames)
+    else:
+        cap = compute_auto_pending_frames(per_frame_mb, ram_fraction, assumed_concurrency)
+    if memory_gb and memory_gb > 0 and per_frame_mb > 0:
+        cap = min(cap, max(_floor, int(memory_gb * 1024 / per_frame_mb)))
+    return cap
+
+
 class VideoPreprocessorModel(Model):
     """Spec-driven video preprocessor.
 
@@ -164,6 +182,9 @@ class VideoPreprocessorModel(Model):
         # many concurrent videos to budget for.
         self._preprocess_ram_fraction = float(configValues.get("preprocess_ram_fraction", 0.6))
         self._preprocess_assumed_concurrency = max(1, int(configValues.get("preprocess_assumed_concurrency", 3)))
+        # Bytes the in-flight backlog of one video may hold, in GB; 0 = no
+        # byte bound. Sized on the first frame, so it holds at any resolution.
+        self._max_pending_memory_gb = float(configValues.get("max_pending_memory_gb", 0) or 0)
 
         # When using deffcode_auto, GPU decoding is chosen only when the
         # video's longest edge is >= this threshold.  0 = always GPU.
@@ -474,11 +495,12 @@ class VideoPreprocessorModel(Model):
                         raise
 
                 spec_start = self.FIXED_OUTPUT_COUNT
-                # Explicit cap: build the semaphore up front.  Auto cap: defer
-                # until the first frame so we can size it from the real
+                # The cap is built on the first frame, sized from the real
                 # per-frame RAM footprint (created lazily in the consumer loop).
+                # Only an explicit frame count with no byte bound needs no size.
                 frame_semaphore = None
-                if not self._max_pending_auto and self._max_pending_frames > 0:
+                _size_cap_on_first_frame = self._max_pending_auto or self._max_pending_memory_gb > 0
+                if not _size_cap_on_first_frame and self._max_pending_frames > 0:
                     frame_semaphore = asyncio.Semaphore(self._max_pending_frames)
                 frame_iterator = iter(frame_source)
                 loop = asyncio.get_running_loop()
@@ -601,20 +623,24 @@ class VideoPreprocessorModel(Model):
                             frame_index, spec_tensors = result
                             frame_count += 1
 
-                            # Auto cap: size the in-flight limit from the real
-                            # per-frame RAM footprint on the first frame.
-                            if frame_semaphore is None and self._max_pending_auto:
+                            # Size the in-flight limit from the real per-frame
+                            # RAM footprint on the first frame.
+                            if frame_semaphore is None and _size_cap_on_first_frame:
                                 _pf_mb = sum(
                                     t.element_size() * t.nelement()
                                     for t in spec_tensors.values() if isinstance(t, torch.Tensor)
                                 ) / (1024 ** 2)
-                                _cap = compute_auto_pending_frames(
-                                    _pf_mb, self._preprocess_ram_fraction,
+                                _cap = compute_pending_frames_cap(
+                                    _pf_mb, self._max_pending_frames, self._max_pending_memory_gb,
+                                    self._preprocess_ram_fraction,
                                     self._preprocess_assumed_concurrency)
                                 self.logger.info(
-                                    "Auto max_pending_frames=%d (per-frame %.1f MB, "
-                                    "%.0f%% RAM budget, ~%d concurrent videos assumed)",
-                                    _cap, _pf_mb, self._preprocess_ram_fraction * 100,
+                                    "max_pending_frames=%d (per-frame %.1f MB, %.1f GB at most; "
+                                    "budget: %s frames, %s GB, %.0f%% RAM over ~%d videos)",
+                                    _cap, _pf_mb, _cap * _pf_mb / 1024,
+                                    self._max_pending_frames or "auto",
+                                    self._max_pending_memory_gb or "no",
+                                    self._preprocess_ram_fraction * 100,
                                     self._preprocess_assumed_concurrency)
                                 frame_semaphore = asyncio.Semaphore(_cap)
 
