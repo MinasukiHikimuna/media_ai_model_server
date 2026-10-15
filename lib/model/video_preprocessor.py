@@ -21,6 +21,7 @@ from lib.model.preprocessing_python.image_preprocessing import (
     probe_video_dimensions,
 )
 from lib.model.preprocessing_python.ffmpeg_pipe import vr_crop_rect
+from lib.utils.host_memory import host_memory_budget
 from lib.pipeline.preprocess_spec import (
     PreprocessSpec,
     apply_spec,
@@ -185,6 +186,11 @@ class VideoPreprocessorModel(Model):
         # Bytes the in-flight backlog of one video may hold, in GB; 0 = no
         # byte bound. Sized on the first frame, so it holds at any resolution.
         self._max_pending_memory_gb = float(configValues.get("max_pending_memory_gb", 0) or 0)
+        # Bytes the decoded frames of every video may hold together, in GB,
+        # counted from the moment a batch is preprocessed: queued, waiting for
+        # a slot under the cap above, or in inference. Shared by the server;
+        # 0 = no bound.
+        self._host_memory_budget = host_memory_budget(configValues.get("preprocess_memory_budget_gb", 0))
 
         # When using deffcode_auto, GPU decoding is chosen only when the
         # video's longest edge is >= this threshold.  0 = always GPU.
@@ -535,6 +541,10 @@ class VideoPreprocessorModel(Model):
                 _result_q = queue.Queue(maxsize=_QUEUE_DEPTH)
                 _producer_error = []
                 _cumulative_cpu = [0.0]   # mutable float for thread
+                _budget_wait = [0.0]      # seconds the producer waited for host memory
+                _stop = threading.Event()  # set when the consumer stops reading
+                _leases = []
+                _budget = self._host_memory_budget
                 _requested_model_names = _requested_names
                 # A spec no requested model reads is not produced, but its key
                 # is still set: the models wired to it are triggered by it,
@@ -558,37 +568,67 @@ class VideoPreprocessorModel(Model):
                     _ss = spec_start
                     _batch = []  # list of (frame_index, raw_frame CHW)
 
+                    def _put(entry):
+                        while not _stop.is_set():
+                            try:
+                                _result_q.put(entry, timeout=0.2)
+                                return True
+                            except queue.Full:
+                                pass
+                        return False
+
                     def _flush():
                         if not _batch:
-                            return
+                            return True
                         t0 = time.perf_counter()
                         raws = torch.stack([rf for _, rf in _batch], dim=0)  # [N,C,H,W]
                         spec_batches = [apply_spec_batch(raws, sp) for sp in _specs]
                         del raws
-                        for bi, (fidx, _) in enumerate(_batch):
+                        indices = [fidx for fidx, _ in _batch]
+                        _batch.clear()
+                        _cumulative_cpu[0] += time.perf_counter() - t0
+                        # Every frame below is a view into its batch, so the
+                        # batch's memory lasts until its last frame is done.
+                        t1 = time.perf_counter()
+                        lease = _budget.acquire(_batch_bytes(spec_batches), len(indices), _stop)
+                        _budget_wait[0] += time.perf_counter() - t1
+                        if lease is None:
+                            return False
+                        _leases.append(lease)
+                        for bi, fidx in enumerate(indices):
                             st = {
                                 _spec_names[si]: spec_batches[si][bi]
                                 for si in range(len(_specs))
                             }
-                            _result_q.put((fidx, st))
-                        _cumulative_cpu[0] += time.perf_counter() - t0
-                        _batch.clear()
+                            if not _put((fidx, st, lease)):
+                                return False
+                        return True
 
                     try:
-                        while True:
+                        while not _stop.is_set():
                             try:
                                 frame_data = next(frame_iterator)
                             except StopIteration:
                                 break
                             _batch.append((frame_data[0], frame_data[1]))
                             del frame_data
-                            if len(_batch) >= self._preprocess_batch_size:
-                                _flush()
-                        _flush()
+                            if len(_batch) >= self._preprocess_batch_size and not _flush():
+                                break
+                        if not _stop.is_set():
+                            _flush()
                     except Exception as exc:
                         _producer_error.append(exc)
                     finally:
-                        _result_q.put(_FRAME_DONE)
+                        _batch.clear()
+                        # The decode is closed by the thread running it: closing
+                        # a generator from another thread while it runs fails.
+                        close = getattr(frame_source, "close", None)
+                        if callable(close):
+                            try:
+                                close()
+                            except Exception as exc:
+                                self.logger.warning("Closing the decode of '%s' failed: %s", input_data, exc)
+                        _put(_FRAME_DONE)
 
                 producer = threading.Thread(
                     target=_frame_producer, daemon=True,
@@ -627,7 +667,7 @@ class VideoPreprocessorModel(Model):
                                 hit_done = True
                                 break
 
-                            frame_index, spec_tensors = result
+                            frame_index, spec_tensors, lease = result
                             frame_count += 1
 
                             # Size the in-flight limit from the real per-frame
@@ -664,6 +704,8 @@ class VideoPreprocessorModel(Model):
                             if frame_semaphore is not None:
                                 await frame_semaphore.acquire()
                             child = await ItemFuture.create(item, payload, item.item_future.handler)
+                            lease.deliver()
+                            child.future.add_done_callback(lambda _, l=lease: l.finish())
                             if frame_semaphore is not None:
                                 child.future.add_done_callback(lambda _, s=frame_semaphore: s.release())
                             children.append((frame_index, child))
@@ -676,16 +718,26 @@ class VideoPreprocessorModel(Model):
                     preprocess_time = _cumulative_cpu[0]
                     producer.join(timeout=10.0)
                 finally:
-                    # Drain queue so the producer isn't stuck on put().
-                    while producer.is_alive():
+                    # Stop the producer (it closes the decode) and drop
+                    # whatever it queued, then give back the memory of frames
+                    # never handed on.
+                    _stop.set()
+                    _deadline = time.monotonic() + 60.0
+                    while producer.is_alive() and time.monotonic() < _deadline:
+                        try:
+                            _result_q.get(timeout=0.2)
+                        except queue.Empty:
+                            pass
+                    if producer.is_alive():
+                        self.logger.warning(
+                            "The decode of '%s' did not stop within 60 s; leaving it to finish on its own",
+                            input_data)
+                    while True:
                         try:
                             _result_q.get_nowait()
                         except queue.Empty:
                             break
-                    producer.join(timeout=5.0)
-                    close = getattr(frame_source, "close", None)
-                    if callable(close):
-                        close()
+                    _settle_leases(_leases, itemFuture)
                     if release_dense_slot is not None:
                         release_dense_slot()  # the decode is over
 
@@ -701,8 +753,10 @@ class VideoPreprocessorModel(Model):
                     metrics["preprocess_backend"] = backend_used
                     metrics["average_frame_preprocess_seconds"] = avg_time
                     self.logger.info(
-                        "Preprocessed %s frames in %.4f seconds (avg %.4f s/frame) using %s backend.",
+                        "Preprocessed %s frames in %.4f seconds (avg %.4f s/frame) using %s backend; "
+                        "waited %.1f s for host memory (%.1f of %.1f GB in use).",
                         frame_count, preprocess_time, avg_time, backend_used,
+                        _budget_wait[0], _budget.in_use / 1024 ** 3, _budget.limit / 1024 ** 3,
                     )
                 elif frames_wanted:
                     error_msg = f"No frames were produced during preprocessing of '{input_data}' using {backend_used} backend."
@@ -734,6 +788,42 @@ class VideoPreprocessorModel(Model):
             finally:
                 if release_dense_slot is not None:
                     release_dense_slot()
+
+
+def _batch_bytes(tensors):
+    """Bytes held by these tensors' storages, each storage counted once."""
+    seen = set()
+    total = 0
+    for tensor in tensors:
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        storage = tensor.untyped_storage()
+        if storage.data_ptr() in seen:
+            continue
+        seen.add(storage.data_ptr())
+        total += storage.nbytes()
+    return total
+
+
+def _settle_leases(leases, item_future):
+    """After a decode: frames never handed on stop counting at once, and
+    whatever is still held is given back when the request ends, even if some
+    of its frames never report done."""
+    for lease in leases:
+        lease.seal()
+    pending = [lease for lease in leases if not lease.released]
+    if not pending:
+        return
+    root = getattr(item_future, "root_future", None) or item_future
+    future = getattr(root, "future", None)
+    if future is None:
+        return
+
+    def release_all(_):
+        for lease in pending:
+            lease.release()
+
+    future.add_done_callback(release_all)
 
 
 def _fail_streams(streams, exception):

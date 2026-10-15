@@ -6,6 +6,7 @@ frame_interval: 2
 use_half_precision: false
 max_pending_frames: auto             # Max preprocessed frames held in memory per video before pausing to let the models catch up. auto = sized from RAM; a number pins it.
 max_pending_memory_gb: 4            # ...and at most this many GB of them per video, whatever their size (0 = no byte bound).
+preprocess_memory_budget_gb: 6      # GB all videos' decoded frames may hold together: queued, waiting, or in inference; a batch counts until its last frame is done (0 = no bound)
 preprocess_backend: av_auto  # av_auto (default: seek when interval>=1s, threaded otherwise), av_seek, av, deffcode_auto, deffcode, deffcode_gpu
 gpu_min_long_edge: 36000            # deffcode_auto: use GPU when video long edge >= this (0 = always GPU)
 decode_workers: 0                   # ffmpeg_parallel: parallel ffmpeg decode processes for true-interval sampling (0 = auto: min(8, cpu_count))

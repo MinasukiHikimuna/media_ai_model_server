@@ -17,6 +17,17 @@ if __name__ == "__main__":
     from uvicorn import Config, Server
     from lib.server.server_manager import app, port
     import lib.server.routes  # noqa: F401  (registers the routes on `app` via decorators)
+    from lib.utils.host_memory import HeapTrimmer
+
+    _trimmer = HeapTrimmer()
+
+    @app.middleware("http")
+    async def trim_heap_after_work(request, call_next):
+        response = await call_next(request)
+        if request.method == "POST":
+            # What a finished request freed in the heap goes back to the system.
+            asyncio.get_running_loop().run_in_executor(None, _trimmer.maybe_trim)
+        return response
 
     config = Config(app, host="0.0.0.0", port=port)
     server = Server(config)
