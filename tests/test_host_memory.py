@@ -245,3 +245,46 @@ def test_a_region_cut_from_an_8_bit_source_is_float():
     assert float(crop.max()) == 200.0
     crop += 1
     assert int(source.max()) == 200
+
+
+def _photo_like(width, height):
+    """An 8-bit frame as decode produces it (float32 holding whole values):
+    smooth gradients plus fine noise, so a resize lands between levels."""
+    generator = torch.Generator().manual_seed(7)
+    y = torch.linspace(0, 1, height).view(1, height, 1)
+    x = torch.linspace(0, 1, width).view(1, 1, width)
+    base = 255 * (0.5 + 0.25 * torch.sin(9 * x + torch.tensor([0.0, 1.0, 2.0]).view(3, 1, 1)) * torch.cos(7 * y))
+    noise = torch.randint(-12, 13, (3, height, width), generator=generator).float()
+    return (base + noise).round().clamp(0, 255)
+
+
+@pytest.mark.parametrize("width, height, max_diff", [
+    (1920, 1080, 0.0),   # kept at full size: the 8-bit source is the decoded frame itself
+    (1280, 720, 0.0),
+    (3840, 2160, 0.5),   # downscaled to 1920: each value rounds to the nearest level
+])
+def test_an_aligned_face_from_the_8_bit_source_matches_the_float_one(width, height, max_diff):
+    from dataclasses import replace
+
+    import numpy as np
+
+    from lib.model.ai_face_embedding_model import _norm_crop_gpu
+    from lib.pipeline.preprocess_spec import apply_spec
+
+    frame = _photo_like(width, height)
+    spec = PreprocessSpec.for_region_source()
+    as_8_bit = apply_spec(frame, spec)
+    as_float = apply_spec(frame, replace(spec, precision="float32"))
+    assert as_8_bit.dtype == torch.uint8 and as_float.dtype == torch.float32
+
+    # Five landmarks of a face filling about a tenth of the source's width.
+    w = as_float.shape[-1]
+    kps = np.array([[0.45, 0.40], [0.55, 0.40], [0.50, 0.46], [0.46, 0.52], [0.54, 0.52]], dtype=np.float32)
+    kps[:, 0] *= w
+    kps[:, 1] *= as_float.shape[-2]
+    kps = (kps - kps.mean(0)) * 0.5 + kps.mean(0)
+
+    assert float((as_8_bit.float() - as_float).abs().max()) <= max_diff
+    aligned_8_bit = _norm_crop_gpu(as_8_bit, kps)
+    aligned_float = _norm_crop_gpu(as_float, kps)
+    assert float((aligned_8_bit - aligned_float).abs().max()) <= max_diff + 1e-4
