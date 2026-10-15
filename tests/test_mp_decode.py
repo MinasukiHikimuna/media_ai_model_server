@@ -1,5 +1,6 @@
 """Parallel PyAV decode tests. Everything here runs without a GPU."""
 
+import itertools
 import shutil
 import subprocess
 
@@ -88,6 +89,102 @@ def test_a_seek_that_decodes_nothing_starts_further_back(single_keyframe_ts):
     assert len(counts) == 5 and all(counts)
     assert len(reference) == 250
     np.testing.assert_array_equal(frames, reference)
+
+
+@pytest.fixture(scope="module")
+def long_gop_mp4(tmp_path_factory):
+    """MP4 with one keyframe in 10 seconds, like the long GOPs of AV1 and
+    streaming encodes. Every segment's seek lands on the keyframe at 0, seconds
+    before the segment starts."""
+    path = tmp_path_factory.mktemp("long_gop") / "long_gop.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", "testsrc2=size=160x90:rate=30000/1001", "-t", "10",
+         "-pix_fmt", "yuv420p", "-c:v", "libx264", "-g", "300", "-keyint_min", "300",
+         "-sc_threshold", "0", "-bf", "2", str(path)],
+        check=True,
+    )
+    return path
+
+
+def _shared_frames(path, workers):
+    """Interval frames by target, segment counts and every frame, from one decode."""
+    segments = {}
+    counts = {}
+
+    def on_dense(segment, _size_index, frames):
+        segments.setdefault(segment, []).append(frames)
+
+    interval = dict(mp_decode.iter_parallel_frames(
+        path, 0.5, 0, workers, True, dense_sizes=[DENSE_SIZE], on_dense=on_dense,
+        on_segment=counts.__setitem__))
+    order = sorted(counts)
+    frames = np.concatenate([clip for segment in order for clip in segments.get(segment, [])])
+    return interval, [counts[segment] for segment in order], frames
+
+
+@needs_ffmpeg
+def test_a_seek_far_before_the_segment_still_delivers_its_frames(long_gop_mp4):
+    interval, counts, frames = _shared_frames(long_gop_mp4, 4)
+    reference_interval, _, reference = _shared_frames(long_gop_mp4, 1)
+
+    assert len(counts) == 4 and all(counts)
+    assert len(reference) == 300
+    np.testing.assert_array_equal(frames, reference)
+    assert sorted(interval) == sorted(reference_interval) and len(interval) == 20
+    for target, frame in reference_interval.items():
+        np.testing.assert_array_equal(interval[target], frame, err_msg=f"target {target}")
+
+
+def test_frames_decoded_before_the_segment_are_not_kept():
+    """Only the first frame, for the seek check, and the frames within the
+    tolerance of the segment start, which can still be sampled for it, are kept
+    of the frames decoded between the keyframe and the segment start."""
+    import gc
+    import weakref
+    from fractions import Fraction
+
+    alive = weakref.WeakSet()
+
+    class _Decoded:
+        def __init__(self, pts):
+            self.pts = pts
+            alive.add(self)
+
+    class _GopPacket(_Packet):
+        def decode(self):
+            return [_Decoded(self.pts)]
+
+    class _Container:
+        def __init__(self):
+            self.seeks = []
+
+        def seek(self, position, stream):
+            self.seeks.append(position)
+
+        def demux(self, _stream):
+            return (_GopPacket(pts) for pts in range(100))  # one keyframe at 0
+
+    class _Tally:
+        def restart(self):
+            pass
+
+        def packet(self, _packet):
+            pass
+
+        def missed_before(self, _pts):
+            return False
+
+    class _TenthStream(_Stream):
+        time_base = Fraction(1, 10)
+
+    container = _Container()
+    frames = mp_decode._decode_from(container, _TenthStream(), 6.0, True, _Tally(), tolerance=0.15)
+    gc.collect()
+
+    assert container.seeks == [60]
+    assert sorted(frame.pts for frame in alive) == [0, 59, 60]
+    assert [frame.pts for frame in itertools.islice(frames, 4)] == [0, 59, 60, 61]
 
 
 @pytest.fixture(scope="module")

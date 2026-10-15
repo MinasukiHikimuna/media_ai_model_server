@@ -92,7 +92,7 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
             dense = _DenseEmitter(options, start_t, stream, out_queue) if dense_sizes else None
             exact = dense is not None and dense.needs_exact_start
             produced = 0
-            for frame in _decode_from(container, stream, start_t, exact, dense):
+            for frame in _decode_from(container, stream, start_t, exact, dense, tol):
                 ft = float(frame.pts * time_base)
                 if dense is not None and not dense.finished:
                     dense.add(frame, ft)
@@ -124,7 +124,7 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
         out_queue.put(None)  # done sentinel
 
 
-def _decode_from(container, stream, start_t, exact, tally=None):
+def _decode_from(container, stream, start_t, exact, tally=None, tolerance=0.0):
     """Seek to ``start_t`` and return the decoded frames from there.
 
     A seek lands on the keyframe whose *decode* time is at or before the
@@ -142,6 +142,13 @@ def _decode_from(container, stream, start_t, exact, tally=None):
     before the first frame from ``start_t``: a seek that lands mid-GOP, as in
     MPEG-TS, can decode a frame before ``start_t`` and still lose the ones
     after it.
+
+    That check decodes on from the keyframe up to ``start_t``, which in a long
+    GOP is hundreds of frames, at 4K about 12 MB each. Of those only the
+    timestamp of the last is needed for the check, and of the frames only the
+    first, which the caller checks the seek with, and the ones within
+    ``tolerance`` of ``start_t``, which can still be the frame sampled for it;
+    the rest are not kept.
     """
     time_base = stream.time_base
     target = start_t
@@ -160,15 +167,18 @@ def _decode_from(container, stream, start_t, exact, tally=None):
         # index is not keyframe-accurate, such as MPEG-TS, can land mid-GOP
         # after the last keyframe, and the decoder then drops everything to EOF.
         if first is not None and not _starts_after(first, float(first.pts * time_base), start_t, stream):
-            buffered = [first]
+            kept = [first]
+            last_pts = first.pts
             if tally is not None:
-                while float(buffered[-1].pts * time_base) < start_t - 1e-9:
+                while float(last_pts * time_base) < start_t - 1e-9:
                     following = next(frames, None)
                     if following is None:
                         break
-                    buffered.append(following)
-            if tally is None or not tally.missed_before(buffered[-1].pts):
-                return itertools.chain(buffered, frames)
+                    last_pts = following.pts
+                    if float(last_pts * time_base) + tolerance >= start_t:
+                        kept.append(following)
+            if tally is None or not tally.missed_before(last_pts):
+                return itertools.chain(kept, frames)
         target = max(0.0, start_t - backoff)
         backoff *= 2
 
