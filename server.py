@@ -18,7 +18,10 @@ if __name__ == "__main__":
     from lib.server.server_manager import app, port
     import lib.server.routes  # noqa: F401  (registers the routes on `app` via decorators)
 
-    config = Config(app, host="0.0.0.0", port=port)
+    # Keep idle connections open longer than a reverse proxy in front keeps
+    # them for reuse (often a minute or two). Otherwise the proxy can send a
+    # request on a connection the server is closing, and fails it with 502.
+    config = Config(app, host="0.0.0.0", port=port, timeout_keep_alive=150)
     server = Server(config)
 
     async def stop_servers():
