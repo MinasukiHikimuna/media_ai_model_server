@@ -15,6 +15,7 @@ already-downscaled frames cross the process boundary.
 import itertools
 import math
 import multiprocessing as mp
+import os
 from typing import Optional
 
 # Frames per dense clip handed to the parent. Purely a transport size.
@@ -35,6 +36,11 @@ EDGE_GAP_SECONDS = 0.5
 # Frames decoded to check that a video's frames come out in display order.
 ORDER_PROBE_FRAMES = 48
 
+# Most decoder threads a worker gets when it splits the CPUs on its own. Each
+# frame thread holds its own reference frames, which at 4K cost far more than
+# the extra threads gain once the workers already keep every CPU busy.
+MAX_DECODE_THREADS = 8
+
 
 def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
                          use_timestamps, out_queue, options=None):
@@ -48,6 +54,8 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
     * ``skip_nonref``: let the decoder drop frames nothing else references.
       The frames it returns are unchanged, but a target can land on the next
       decodable frame instead of its own.
+    * ``decode_threads``: the decoder's thread count; see :func:`_threading`.
+      Unset, FFmpeg picks one as if this worker had the machine to itself.
     * ``dense_sizes``: ``[(width, height), ...]``. Every frame of this chunk's
       time range is also resized to each size and pushed as
       ``("__dense__", segment, size_index, [n, H, W, 3] uint8)``, followed by
@@ -69,7 +77,11 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
         container = av.open(str(path))
         try:
             stream = container.streams.video[0]
-            stream.thread_type = _thread_type(stream.codec_context.name, bool(dense_sizes))
+            thread_type, thread_count = _threading(
+                stream.codec_context.name, bool(dense_sizes), options.get("decode_threads"))
+            stream.thread_type = thread_type
+            if thread_count:
+                stream.thread_count = thread_count
             if options.get("skip_nonref") and not dense_sizes:
                 stream.codec_context.skip_frame = "NONREF"
             time_base = stream.time_base
@@ -161,18 +173,42 @@ def _decode_from(container, stream, start_t, exact, tally=None):
         backoff *= 2
 
 
-def _thread_type(codec_name, every_frame):
-    """The decoder threading for a chunk.
+def _threading(codec_name, every_frame, threads=None):
+    """``(thread_type, thread_count)`` for a chunk's decoder.
+
+    ``threads`` is the count the chunk was given, or ``None`` to leave it to
+    FFmpeg, which is then returned as the count too.
 
     Frame threading is what makes PyAV decode fast, but FFmpeg's MPEG-4 Part 2
     decoder returns different frames with it on files with packed B-frames, a
     DivX/Xvid AVI convention, and differently again under load. The every-frame
     consumers need the frames exactly, so they decode MPEG-4 Part 2 on one
-    thread per chunk; the chunks still run in parallel.
+    thread per chunk, whatever the chunk was given; the chunks still run in
+    parallel.
     """
     if every_frame and codec_name == "mpeg4":
-        return "SLICE"  # the decoder has no slice threading, so: one thread
-    return "AUTO"
+        return "SLICE", 1  # the decoder has no slice threading, so: one thread
+    return "AUTO", threads
+
+
+def threads_per_worker(workers, cpus=None):
+    """Decoder threads for each of ``workers`` parallel decode workers.
+
+    FFmpeg sizes a decoder's thread pool by the CPUs of the whole machine, so
+    every worker left to it starts as many threads as there are CPUs, and each
+    frame thread holds reference frames of its own. Splitting the CPUs between
+    the workers keeps them all busy for a fraction of the memory.
+    """
+    if cpus is None:
+        cpus = _available_cpus()
+    return max(1, min(MAX_DECODE_THREADS, cpus // max(1, workers)))
+
+
+def _available_cpus():
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):  # not on Linux
+        return os.cpu_count() or 4
 
 
 def _seek(container, stream, target, fresh):
@@ -440,10 +476,15 @@ def probe_frame_order(path, frames: int = ORDER_PROBE_FRAMES):
 def iter_parallel_frames(path, frame_interval, max_long_edge, decode_workers,
                          use_timestamps, queue_depth: int = 64, *, skip_nonref: bool = False,
                          dense_sizes=None, dense_crop=None, on_dense=None, on_segment=None,
-                         on_dense_failed=None, emit_interval: bool = True):
+                         on_dense_failed=None, emit_interval: bool = True,
+                         decode_threads_per_worker=None):
     """Yield (out_idx, HWC uint8 ndarray) from parallel decode worker processes.
 
     Frames arrive out of timestamp order; each carries its target time/index.
+
+    Each worker's decoder runs ``decode_threads_per_worker`` threads; ``None``
+    or 0 splits the CPUs between the workers that are started, see
+    :func:`threads_per_worker`.
 
     With ``dense_sizes`` every frame is also delivered, resized to each size,
     through ``on_dense(segment, size_index, frames)``; ``on_segment(segment,
@@ -477,7 +518,7 @@ def iter_parallel_frames(path, frame_interval, max_long_edge, decode_workers,
     # B-frames, one chunk delivers every frame and the rest only sample.
     split_dense, first_pts = probe_frame_order(path) if dense_sizes else (False, None)
 
-    procs = []
+    launches = []
     for segment, (start_idx, count) in enumerate(chunks):
         options = {"skip_nonref": bool(skip_nonref)}
         if dense_sizes and (split_dense or segment == 0):
@@ -492,6 +533,14 @@ def iter_parallel_frames(path, frame_interval, max_long_edge, decode_workers,
             )
         elif not emit_interval:
             continue  # nothing to decode for
+        launches.append((start_idx, count, options))
+
+    threads = int(decode_threads_per_worker or 0)
+    if threads <= 0:
+        threads = threads_per_worker(len(launches))
+    procs = []
+    for start_idx, count, options in launches:
+        options["decode_threads"] = threads
         proc = ctx.Process(
             target=_decode_chunk_worker,
             args=(str(path), start_idx, count if emit_interval else 0, frame_interval,

@@ -126,6 +126,10 @@ class VideoPreprocessorModel(Model):
         # saturates memory bandwidth on typical multi-core boxes).
         _workers = configValues.get("decode_workers", 0)
         self._decode_workers = int(_workers) if _workers else min(8, os.cpu_count() or 4)
+        # Decoder threads in each of those workers. 0 = auto: the CPUs split
+        # between the workers, so each does not size its thread pool for the
+        # whole machine; every frame thread holds its own reference frames.
+        self._decode_threads_per_worker = int(configValues.get("decode_threads_per_worker", 0) or 0)
 
         # How many frames to resize/normalize per batched GPU call.  Larger =
         # fewer GIL-held dispatches (better decode/inference overlap) at the cost
@@ -305,6 +309,7 @@ class VideoPreprocessorModel(Model):
                     preprocess_callable = functools.partial(
                         preprocess_video_mp_pyav,
                         decode_workers=self._decode_workers,
+                        decode_threads_per_worker=self._decode_threads_per_worker,
                         dense_sinks=dense_sinks,
                         dense_crop=dense_crop,
                         emit_interval=frames_wanted,
@@ -331,6 +336,7 @@ class VideoPreprocessorModel(Model):
                         preprocess_callable = functools.partial(
                             preprocess_video_mp_pyav,
                             decode_workers=self._decode_workers,
+                            decode_threads_per_worker=self._decode_threads_per_worker,
                             skip_nonref=self._skip_nonref,
                         )
                         backend_used = "mp_pyav"

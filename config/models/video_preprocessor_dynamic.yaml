@@ -8,3 +8,4 @@ max_pending_frames: 19200             # Max preprocessed frames held in memory b
 preprocess_backend: av_auto  # av_auto (default: seek when interval>=1s, threaded otherwise), av_seek, av, deffcode_auto, deffcode, deffcode_gpu
 gpu_min_long_edge: 36000            # deffcode_auto: use GPU when video long edge >= this (0 = always GPU)
 decode_workers: 0                   # ffmpeg_parallel: parallel ffmpeg decode processes for true-interval sampling (0 = auto: min(8, cpu_count))
+decode_threads_per_worker: 0        # decoder threads in each decode worker (0 = auto: cpu_count // decode_workers, at most 8)
