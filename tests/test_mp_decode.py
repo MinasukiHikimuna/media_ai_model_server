@@ -391,9 +391,68 @@ def test_a_video_starting_after_zero_seeks_to_its_start(indexed_flv):
 
 
 def test_mpeg4_part_2_decodes_on_one_thread_for_every_frame_consumers():
-    assert mp_decode._thread_type("mpeg4", True) == "SLICE"
-    assert mp_decode._thread_type("mpeg4", False) == "AUTO"
-    assert mp_decode._thread_type("h264", True) == "AUTO"
+    assert mp_decode._threading("mpeg4", True, 4) == ("SLICE", 1)
+    assert mp_decode._threading("mpeg4", True, None) == ("SLICE", 1)
+    assert mp_decode._threading("mpeg4", False, 4) == ("AUTO", 4)
+    assert mp_decode._threading("h264", True, 4) == ("AUTO", 4)
+    assert mp_decode._threading("h264", True, None) == ("AUTO", None)
+
+
+def test_the_workers_split_the_cpus_between_their_decoders():
+    assert mp_decode.threads_per_worker(8, cpus=32) == 4
+    assert mp_decode.threads_per_worker(8, cpus=12) == 1
+    assert mp_decode.threads_per_worker(8, cpus=4) == 1
+    assert mp_decode.threads_per_worker(3, cpus=16) == 5
+    assert mp_decode.threads_per_worker(1, cpus=64) == mp_decode.MAX_DECODE_THREADS
+    assert mp_decode.threads_per_worker(0, cpus=2) == 2
+
+
+def _launched_options(monkeypatch, path, workers, **kwargs):
+    """The options each worker of a decode is started with. Nothing decodes."""
+    import queue
+
+    launched = []
+
+    class _Context:
+        def Queue(self, maxsize):
+            self.queue = queue.Queue()
+            return self.queue
+
+        def Process(self, target, args, daemon):
+            launched.append(args[-1])
+            context = self
+
+            class _Process:
+                def start(self):
+                    context.queue.put(None)
+
+                def is_alive(self):
+                    return False
+
+                def join(self, timeout):
+                    pass
+
+            return _Process()
+
+    monkeypatch.setattr(mp_decode.mp, "get_context", lambda _method: _Context())
+    monkeypatch.setattr(mp_decode, "_available_cpus", lambda: 16)
+    list(mp_decode.iter_parallel_frames(path, 0.5, 0, workers, True, **kwargs))
+    return launched
+
+
+@needs_ffmpeg
+def test_each_worker_is_given_its_share_of_the_cpus(monkeypatch, open_gop_clip, b_frame_avi):
+    options = _launched_options(monkeypatch, open_gop_clip, 4)
+    assert [option["decode_threads"] for option in options] == [4] * 4
+
+    options = _launched_options(monkeypatch, open_gop_clip, 4, decode_threads_per_worker=3)
+    assert [option["decode_threads"] for option in options] == [3] * 4
+
+    # Only the workers that are started share the CPUs: here one worker
+    # delivers every frame and the others would only have sampled.
+    options = _launched_options(monkeypatch, b_frame_avi, 4, dense_sizes=[DENSE_SIZE],
+                                on_dense=lambda *_: None, emit_interval=False)
+    assert [option["decode_threads"] for option in options] == [8]
 
 
 def test_a_refused_seek_back_to_zero_falls_back_to_the_stream_start():

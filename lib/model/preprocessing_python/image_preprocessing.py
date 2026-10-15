@@ -1198,6 +1198,7 @@ def preprocess_video_mp_pyav(
     norm_config=1,
     max_decode_long_edge=0,
     decode_workers=None,
+    decode_threads_per_worker=None,
     skip_nonref=False,
     dense_sinks=None,
     dense_crop=None,
@@ -1219,6 +1220,9 @@ def preprocess_video_mp_pyav(
     ``skip_nonref`` lets the decoder drop frames nothing else references, which
     is roughly twice as fast on sources with B-frames; a sample can then land
     on the next decodable frame instead of its own.
+
+    ``decode_threads_per_worker`` is each worker's decoder thread count;
+    ``None`` or 0 splits the CPUs between the workers.
 
     ``dense_sinks`` is ``[((width, height), [DenseFrameStream, ...]), ...]``:
     every frame of the video is also resized to each size and handed to its
@@ -1284,6 +1288,7 @@ def preprocess_video_mp_pyav(
             on_segment=_on_segment if dense_sinks else None,
             on_dense_failed=_on_dense_failed if dense_sinks else None,
             emit_interval=emit_interval,
+            decode_threads_per_worker=decode_threads_per_worker,
         ):
             result = _prepare_frame(frame_np, device, vr_video, frame_transforms)
             yield (out_idx, result)
