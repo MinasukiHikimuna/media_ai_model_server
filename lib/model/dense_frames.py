@@ -75,6 +75,12 @@ class DenseFrameStream:
     def attach(self) -> None:
         self._attached.set()
 
+    def start_producing(self) -> None:
+        """The decode for this stream starts now. A stream can wait a long time
+        for its decode, for a slot among the every-frame decodes, and the
+        consumer's attach timeout is meant to run from when frames arrive."""
+        self._created = time.monotonic()
+
     def abandon(self) -> None:
         """Stop reading. The producer's pending and future puts return at once."""
         self._abandoned.set()

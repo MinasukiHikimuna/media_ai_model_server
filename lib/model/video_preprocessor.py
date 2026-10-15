@@ -29,6 +29,55 @@ from lib.pipeline.preprocess_spec import (
 )
 
 
+class DenseDecodeSlots:
+    """Server-wide limit on every-frame decodes running at once.
+
+    Decoding every frame of a 4K video costs 12-14 GB and already runs in
+    parallel workers, so a second one at the same time mostly competes for the
+    same CPUs and disk while doubling the memory. Requests over the limit wait
+    for a slot rather than fail; decodes for sampled frames only take no slot.
+    A limit of 0 or less means no limit.
+    """
+
+    def __init__(self, limit: int):
+        self.limit = int(limit)
+        self.running = 0
+        self._semaphore = asyncio.Semaphore(self.limit) if self.limit > 0 else None
+
+    async def acquire(self, on_wait=None):
+        """Wait for a slot and return a callable that frees it; calling it again does nothing.
+        ``on_wait`` is called once if the slot is not free at once."""
+        if self._semaphore is not None:
+            if self._semaphore.locked() and on_wait is not None:
+                on_wait(self.running)
+            await self._semaphore.acquire()
+        self.running += 1
+        released = False
+
+        def release():
+            nonlocal released
+            if released:
+                return
+            released = True
+            self.running -= 1
+            if self._semaphore is not None:
+                self._semaphore.release()
+
+        return release
+
+
+_dense_decode_slots = None
+
+
+def dense_decode_slots(limit: int) -> DenseDecodeSlots:
+    """The limiter every video preprocessor of this server shares; the first
+    preprocessor's configured limit applies."""
+    global _dense_decode_slots
+    if _dense_decode_slots is None:
+        _dense_decode_slots = DenseDecodeSlots(limit)
+    return _dense_decode_slots
+
+
 def compute_auto_pending_frames(per_frame_mb, ram_fraction, assumed_concurrency,
                                 _min=32, _max=4096, _fallback=256):
     """RAM-safe per-video cap on in-flight preprocessed frames.
@@ -130,6 +179,9 @@ class VideoPreprocessorModel(Model):
         # between the workers, so each does not size its thread pool for the
         # whole machine; every frame thread holds its own reference frames.
         self._decode_threads_per_worker = int(configValues.get("decode_threads_per_worker", 0) or 0)
+        # Every-frame decodes running at once across the server; the rest wait.
+        _dense_limit = configValues.get("max_concurrent_dense_decodes", 1)
+        self._dense_decode_slots = dense_decode_slots(1 if _dense_limit is None else int(_dense_limit))
 
         # How many frames to resize/normalize per batched GPU call.  Larger =
         # fewer GIL-held dispatches (better decode/inference overlap) at the cost
@@ -238,6 +290,7 @@ class VideoPreprocessorModel(Model):
     async def worker_function(self, data):
         for item in data:
             dense_streams = []
+            release_dense_slot = None
             try:
                 preprocess_time = 0.0
                 itemFuture = item.item_future
@@ -280,6 +333,13 @@ class VideoPreprocessorModel(Model):
                         by_size.setdefault(size, []).append(stream)
                         dense_streams.append(stream)
                     dense_sinks = list(by_size.items())
+                    release_dense_slot = await self._dense_decode_slots.acquire(
+                        lambda running, path=input_data: self.logger.info(
+                            "Waiting to decode every frame of '%s': %d every-frame decode(s) running, limit %d",
+                            path, running, self._dense_decode_slots.limit,
+                        ))
+                    for stream in dense_streams:
+                        stream.start_producing()
 
                 children = []
                 frame_count = 0
@@ -585,6 +645,8 @@ class VideoPreprocessorModel(Model):
                     close = getattr(frame_source, "close", None)
                     if callable(close):
                         close()
+                    if release_dense_slot is not None:
+                        release_dense_slot()  # the decode is over
 
                 if frame_count > 0:
                     avg_time = preprocess_time / frame_count
@@ -628,6 +690,9 @@ class VideoPreprocessorModel(Model):
                 self.logger.debug("Stack trace:", exc_info=True)
                 _fail_streams(dense_streams, e)
                 itemFuture.set_exception(e)
+            finally:
+                if release_dense_slot is not None:
+                    release_dense_slot()
 
 
 def _fail_streams(streams, exception):
