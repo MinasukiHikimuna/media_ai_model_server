@@ -47,11 +47,13 @@ class PreprocessSpec:
     max_long_edge: int = 0    # 0 = no cap; >0 = cap longest edge (preserving aspect).
     center_crop: bool = False # True = resize shortest edge then center-crop (CLIP-style).
     interpolation: str = "bilinear"  # "bilinear" or "bicubic".
-    precision: str = ""       # "float16", "bfloat16", "float32", or "" (auto from half_precision).
+    precision: str = ""       # "float16", "bfloat16", "float32", "uint8" (raw [0,255] only), or "" (auto from half_precision).
 
     @property
     def effective_dtype(self) -> torch.dtype:
         """Resolved dtype: explicit precision field wins, else half_precision flag."""
+        if self.precision == "uint8":
+            return torch.uint8
         if self.precision == "bfloat16":
             return torch.bfloat16
         if self.precision == "float16" or (not self.precision and self.half_precision):
@@ -64,7 +66,7 @@ class PreprocessSpec:
         size = f"{self.width}x{self.height}" if (self.width or self.height) else "native"
         norm = "raw" if self.normalization == -1 else f"n{self.normalization}"
         dtype = self.effective_dtype
-        prec_map = {torch.float16: "f16", torch.bfloat16: "bf16", torch.float32: "f32"}
+        prec_map = {torch.float16: "f16", torch.bfloat16: "bf16", torch.float32: "f32", torch.uint8: "u8"}
         prec = prec_map.get(dtype, "f32")
         cap = f"_max{self.max_long_edge}" if self.max_long_edge > 0 else ""
         crop = "_ccrop" if self.center_crop else ""
@@ -161,7 +163,9 @@ class PreprocessSpec:
     def for_region_source(max_long_edge: Optional[int] = None) -> "PreprocessSpec":
         """Spec for a full-resolution region-source tensor (face/region cropping).
 
-        Stays on CPU to avoid GPU memory pressure from large tensors.
+        Stays on CPU to avoid GPU memory pressure from large tensors, and is
+        kept as 8-bit like the decoded frame: a quarter of float32, the largest
+        tensor of a frame. Its readers convert what they cut out of it.
         """
         if max_long_edge is None:
             try:
@@ -172,6 +176,7 @@ class PreprocessSpec:
             width=0, height=0,
             normalization=-1, device="cpu",
             half_precision=False, max_long_edge=max_long_edge,
+            precision="uint8",
         )
 
 
@@ -273,8 +278,8 @@ def apply_spec(source: torch.Tensor, spec: PreprocessSpec) -> torch.Tensor:
             ).squeeze(0)
             resized = True
 
-    # Ensure we never alias the source tensor.
-    if not resized:
+    # Ensure we never alias the source tensor (rounding to 8-bit copies anyway).
+    if not resized and spec.effective_dtype != torch.uint8:
         t = t.clone()
 
     # 2. Device -----------------------------------------------------------
@@ -295,9 +300,17 @@ def apply_spec(source: torch.Tensor, spec: PreprocessSpec) -> torch.Tensor:
 
     # 4. Precision --------------------------------------------------------
     if spec.half_precision or spec.precision:
-        t = t.to(spec.effective_dtype)
+        t = _to_precision(t, spec)
 
     return t
+
+
+def _to_precision(t: torch.Tensor, spec: PreprocessSpec) -> torch.Tensor:
+    dtype = spec.effective_dtype
+    if dtype == torch.uint8:
+        # Raw [0,255] values, rounded rather than truncated.
+        return t.round().clamp_(0, 255).to(torch.uint8)
+    return t.to(dtype)
 
 
 def apply_spec_batch(source: torch.Tensor, spec: PreprocessSpec) -> torch.Tensor:
@@ -354,7 +367,7 @@ def apply_spec_batch(source: torch.Tensor, spec: PreprocessSpec) -> torch.Tensor
             t = F.interpolate(t, size=(new_h, new_w), mode=interp_mode, align_corners=False)
             resized = True
 
-    if not resized:
+    if not resized and spec.effective_dtype != torch.uint8:
         t = t.clone()
 
     # 2. Normalize --------------------------------------------------------
@@ -367,6 +380,6 @@ def apply_spec_batch(source: torch.Tensor, spec: PreprocessSpec) -> torch.Tensor
 
     # 3. Precision --------------------------------------------------------
     if spec.half_precision or spec.precision:
-        t = t.to(spec.effective_dtype)
+        t = _to_precision(t, spec)
 
     return t
