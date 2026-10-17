@@ -438,6 +438,7 @@ class VideoPreprocessorModel(Model):
                 _result_q = queue.Queue(maxsize=_QUEUE_DEPTH)
                 _producer_error = []
                 _cumulative_cpu = [0.0]   # mutable float for thread
+                _stop = threading.Event()  # set when the consumer stops reading
                 _requested_model_names = _requested_names
                 # A spec no requested model reads is not produced, but its key
                 # is still set: the models wired to it are triggered by it,
@@ -461,37 +462,59 @@ class VideoPreprocessorModel(Model):
                     _ss = spec_start
                     _batch = []  # list of (frame_index, raw_frame CHW)
 
+                    def _put(entry):
+                        while not _stop.is_set():
+                            try:
+                                _result_q.put(entry, timeout=0.2)
+                                return True
+                            except queue.Full:
+                                pass
+                        return False
+
                     def _flush():
                         if not _batch:
-                            return
+                            return True
                         t0 = time.perf_counter()
                         raws = torch.stack([rf for _, rf in _batch], dim=0)  # [N,C,H,W]
                         spec_batches = [apply_spec_batch(raws, sp) for sp in _specs]
                         del raws
-                        for bi, (fidx, _) in enumerate(_batch):
+                        indices = [fidx for fidx, _ in _batch]
+                        _batch.clear()
+                        _cumulative_cpu[0] += time.perf_counter() - t0
+                        for bi, fidx in enumerate(indices):
                             st = {
                                 _spec_names[si]: spec_batches[si][bi]
                                 for si in range(len(_specs))
                             }
-                            _result_q.put((fidx, st))
-                        _cumulative_cpu[0] += time.perf_counter() - t0
-                        _batch.clear()
+                            if not _put((fidx, st)):
+                                return False
+                        return True
 
                     try:
-                        while True:
+                        while not _stop.is_set():
                             try:
                                 frame_data = next(frame_iterator)
                             except StopIteration:
                                 break
                             _batch.append((frame_data[0], frame_data[1]))
                             del frame_data
-                            if len(_batch) >= self._preprocess_batch_size:
-                                _flush()
-                        _flush()
+                            if len(_batch) >= self._preprocess_batch_size and not _flush():
+                                break
+                        if not _stop.is_set():
+                            _flush()
                     except Exception as exc:
                         _producer_error.append(exc)
                     finally:
-                        _result_q.put(_FRAME_DONE)
+                        _batch.clear()
+                        # The decode is closed by the thread running it: closing
+                        # a generator from another thread while it runs fails.
+                        close = getattr(frame_source, "close", None)
+                        if callable(close):
+                            try:
+                                close()
+                            except Exception as exc:
+                                self.logger.warning("Closing the decode of '%s' failed: %s", input_data, exc)
+                        _put(_FRAME_DONE)
 
                 producer = threading.Thread(
                     target=_frame_producer, daemon=True,
@@ -575,16 +598,24 @@ class VideoPreprocessorModel(Model):
                     preprocess_time = _cumulative_cpu[0]
                     producer.join(timeout=10.0)
                 finally:
-                    # Drain queue so the producer isn't stuck on put().
-                    while producer.is_alive():
+                    # Stop the producer (it closes the decode) and drop
+                    # whatever it queued.
+                    _stop.set()
+                    _deadline = time.monotonic() + 60.0
+                    while producer.is_alive() and time.monotonic() < _deadline:
+                        try:
+                            _result_q.get(timeout=0.2)
+                        except queue.Empty:
+                            pass
+                    if producer.is_alive():
+                        self.logger.warning(
+                            "The decode of '%s' did not stop within 60 s; leaving it to finish on its own",
+                            input_data)
+                    while True:
                         try:
                             _result_q.get_nowait()
                         except queue.Empty:
                             break
-                    producer.join(timeout=5.0)
-                    close = getattr(frame_source, "close", None)
-                    if callable(close):
-                        close()
 
                 if frame_count > 0:
                     avg_time = preprocess_time / frame_count
