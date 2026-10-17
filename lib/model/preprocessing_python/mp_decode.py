@@ -13,18 +13,24 @@ already-downscaled frames cross the process boundary.
 """
 
 import itertools
+import logging
 import math
 import multiprocessing as mp
 import os
 from typing import Optional
 
+_LOGGER = logging.getLogger("logger")
+
 # Frames per dense clip handed to the parent. Purely a transport size.
 DENSE_CLIP_FRAMES = 100
 
-# Packets the decoder may reject in one chunk before the chunk fails. Only a
-# chunk that feeds the every-frame consumers gets past rejected packets at all
-# (see _DenseEmitter); more than this means the file is unreadable, not damaged.
+# Packets the decoder may reject in one chunk before the chunk fails; more
+# than this means the file is unreadable, not damaged. A chunk that feeds the
+# every-frame consumers fails past it (see _DenseEmitter). A chunk that only
+# samples frames fails only when they are also more than MAX_REJECTED_SHARE of
+# its packets, so one damaged stretch of a long chunk costs only its frames.
 MAX_REJECTED_PACKETS = 32
+MAX_REJECTED_SHARE = 0.1
 
 # Frames at either end of a video that no decoder can produce are left out of
 # the every-frame delivery when they span at most this long: at the start,
@@ -92,7 +98,8 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
             dense = _DenseEmitter(options, start_t, stream, out_queue) if dense_sizes else None
             exact = dense is not None and dense.needs_exact_start
             produced = 0
-            for frame in _decode_from(container, stream, start_t, exact, dense, tol):
+            rejects = _Rejects(stream) if dense is None else None
+            for frame in _decode_from(container, stream, start_t, exact, dense, tol, rejects):
                 ft = float(frame.pts * time_base)
                 if dense is not None and not dense.finished:
                     dense.add(frame, ft)
@@ -113,6 +120,11 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
                     break
             if dense is not None:
                 dense.close()
+            if rejects is not None and rejects.count:
+                if rejects.unreadable():
+                    raise RuntimeError(
+                        f"the decoder rejected {rejects.count} of {rejects.packets} packets: {rejects.first}")
+                out_queue.put(("__rejected__", start_t, rejects.count, rejects.first))
         finally:
             container.close()
     except Exception as exc:  # surface to the parent as a sentinel payload
@@ -124,7 +136,7 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
         out_queue.put(None)  # done sentinel
 
 
-def _decode_from(container, stream, start_t, exact, tally=None, tolerance=0.0):
+def _decode_from(container, stream, start_t, exact, tally=None, tolerance=0.0, rejects=None):
     """Seek to ``start_t`` and return the decoded frames from there.
 
     A seek lands on the keyframe whose *decode* time is at or before the
@@ -137,7 +149,7 @@ def _decode_from(container, stream, start_t, exact, tally=None, tolerance=0.0):
     only for the seeks that land late.
 
     ``tally`` sees every packet read and every packet the decoder rejects; see
-    :func:`_decoded_frames`. With one, a seek is also retried when a packet
+    :func:`_decoded_frames`, as does ``rejects``. With one, a seek is also retried when a packet
     displayed from ``start_t`` on was read but its frame did not come out
     before the first frame from ``start_t``: a seek that lands mid-GOP, as in
     MPEG-TS, can decode a frame before ``start_t`` and still lose the ones
@@ -159,7 +171,7 @@ def _decode_from(container, stream, start_t, exact, tally=None, tolerance=0.0):
         fresh = False
         if tally is not None:
             tally.restart()
-        frames = _decoded_frames(container, stream, tally)
+        frames = _decoded_frames(container, stream, tally, rejects)
         if not exact or target <= 0:
             return frames
         first = next(frames, None)
@@ -240,27 +252,33 @@ def _seek(container, stream, target, fresh):
         container.seek(stream.start_time, stream=stream)
 
 
-def _decoded_frames(container, stream, tally):
+def _decoded_frames(container, stream, tally, rejects=None):
     """The frames of ``stream`` with a timestamp, in display order.
 
-    Without a ``tally`` this is ``container.decode``: a packet the decoder
-    rejects raises. With one, each packet is counted through
-    ``tally.packet(packet)``, a rejected packet goes to
-    ``tally.rejected(packet, exc)`` instead of ending the decode, and a frame
-    without a timestamp, which is dropped either way, is reported through
-    ``tally.untimed_frame()``.
+    With a ``tally``, each packet is counted through ``tally.packet(packet)``,
+    a rejected packet goes to ``tally.rejected(packet, exc)`` instead of
+    ending the decode, and a frame without a timestamp, which is dropped
+    either way, is reported through ``tally.untimed_frame()``. Without one, a
+    rejected packet is counted in ``rejects`` (a :class:`_Rejects`) and
+    skipped; the decoder picks up again at the next frame it can decode.
+    Without either, a rejected packet raises.
     """
     import av
 
     for packet in container.demux(stream):
         if tally is not None:
             tally.packet(packet)
+        elif rejects is not None:
+            rejects.packets += 1
         try:
             frames = packet.decode()
         except av.error.InvalidDataError as exc:
-            if tally is None:
+            if tally is not None:
+                tally.rejected(packet, exc)
+            elif rejects is not None:
+                rejects.add(packet, exc)
+            else:
                 raise
-            tally.rejected(packet, exc)
             continue
         for frame in frames:
             if frame.pts is not None:
@@ -276,6 +294,31 @@ def _starts_after(frame, ft, start_t, stream):
     """
     first_pts = stream.start_time
     return ft > start_t + 1e-9 and not (first_pts is not None and frame.pts <= first_pts)
+
+
+class _Rejects:
+    """Packets the decoder rejected in a chunk that only samples frames.
+
+    Damage in a file, such as a broken packet in a download, costs the frames
+    that depend on it; a sample that would land on one of them takes the next
+    frame that decodes. Only a chunk the decoder rejects throughout is
+    unreadable; see :data:`MAX_REJECTED_SHARE`.
+    """
+
+    def __init__(self, stream):
+        self._time_base = stream.time_base
+        self.packets = 0
+        self.count = 0
+        self.first = None
+
+    def add(self, packet, exc):
+        self.count += 1
+        if self.first is None:
+            at = "" if packet.pts is None else f" at or before {float(packet.pts * self._time_base):.3f}s"
+            self.first = f"{type(exc).__name__}{at}: {exc}"
+
+    def unreadable(self):
+        return self.count > MAX_REJECTED_PACKETS and self.count > MAX_REJECTED_SHARE * self.packets
 
 
 class _DenseEmitter:
@@ -575,6 +618,12 @@ def iter_parallel_frames(path, frame_interval, max_long_edge, decode_workers,
                 if item[0] == "__dense__":
                     if on_dense is not None:
                         on_dense(item[1], item[2], item[3])
+                    continue
+                if item[0] == "__rejected__":
+                    _LOGGER.warning(
+                        "Skipped %d damaged packet(s) decoding '%s' in the part from %.1fs; "
+                        "samples there take the next frame that decodes. First: %s",
+                        item[2], path, item[1], item[3])
                     continue
                 if item[0] == "__segment__":
                     if on_segment is not None:

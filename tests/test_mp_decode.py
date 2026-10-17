@@ -239,12 +239,37 @@ def test_a_damaged_frame_fails_only_the_every_frame_stream(damaged_clip):
 
 
 @needs_ffmpeg
-def test_a_damaged_frame_still_fails_an_interval_only_decode(damaged_clip):
-    """Without every-frame consumers the decode is unchanged: a rejected packet
-    fails it, as it always has."""
-    damaged, _clean = damaged_clip
-    with pytest.raises(RuntimeError, match="InvalidDataError"):
-        list(mp_decode.iter_parallel_frames(damaged, 0.5, 0, 4, True))
+def test_a_damaged_frame_does_not_fail_an_interval_only_decode(damaged_clip, caplog):
+    """Without every-frame consumers a rejected packet costs only the frames
+    that depend on it: every interval target still gets a frame, and the
+    skipped packet is logged."""
+    damaged, clean = damaged_clip
+    targets = sorted(target for target, _frame in mp_decode.iter_parallel_frames(damaged, 0.5, 0, 4, True))
+    clean_targets = sorted(target for target, _frame in mp_decode.iter_parallel_frames(clean, 0.5, 0, 4, True))
+
+    assert targets == clean_targets
+    assert "damaged packet" in caplog.text
+
+
+def test_a_chunk_is_unreadable_only_when_most_of_it_is_rejected():
+    """A long chunk with one damaged stretch keeps going; a chunk the decoder
+    rejects throughout fails."""
+    error = ValueError("rejected")
+    rejects = mp_decode._Rejects(_Stream())
+    rejects.packets = 5000
+    for _ in range(mp_decode.MAX_REJECTED_PACKETS + 100):
+        rejects.add(_Packet(3), error)
+    assert not rejects.unreadable()
+    assert rejects.first == "ValueError at or before 3.000s: rejected"
+
+    rejects.packets = 200
+    assert rejects.unreadable()
+
+    rejects = mp_decode._Rejects(_Stream())
+    rejects.packets = 40
+    for _ in range(mp_decode.MAX_REJECTED_PACKETS):
+        rejects.add(_Packet(3), error)
+    assert not rejects.unreadable()
 
 
 @needs_ffmpeg
