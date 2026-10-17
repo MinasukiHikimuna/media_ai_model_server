@@ -13,17 +13,24 @@ already-downscaled frames cross the process boundary.
 """
 
 import itertools
+import logging
 import math
 import multiprocessing as mp
+import os
 from typing import Optional
+
+_LOGGER = logging.getLogger("logger")
 
 # Frames per dense clip handed to the parent. Purely a transport size.
 DENSE_CLIP_FRAMES = 100
 
-# Packets the decoder may reject in one chunk before the chunk fails. Only a
-# chunk that feeds the every-frame consumers gets past rejected packets at all
-# (see _DenseEmitter); more than this means the file is unreadable, not damaged.
+# Packets the decoder may reject in one chunk before the chunk fails; more
+# than this means the file is unreadable, not damaged. A chunk that feeds the
+# every-frame consumers fails past it (see _DenseEmitter). A chunk that only
+# samples frames fails only when they are also more than MAX_REJECTED_SHARE of
+# its packets, so one damaged stretch of a long chunk costs only its frames.
 MAX_REJECTED_PACKETS = 32
+MAX_REJECTED_SHARE = 0.1
 
 # Frames at either end of a video that no decoder can produce are left out of
 # the every-frame delivery when they span at most this long: at the start,
@@ -34,6 +41,11 @@ EDGE_GAP_SECONDS = 0.5
 
 # Frames decoded to check that a video's frames come out in display order.
 ORDER_PROBE_FRAMES = 48
+
+# Most decoder threads a worker gets when it splits the CPUs on its own. Each
+# frame thread holds its own reference frames, which at 4K cost far more than
+# the extra threads gain once the workers already keep every CPU busy.
+MAX_DECODE_THREADS = 8
 
 
 def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
@@ -48,6 +60,8 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
     * ``skip_nonref``: let the decoder drop frames nothing else references.
       The frames it returns are unchanged, but a target can land on the next
       decodable frame instead of its own.
+    * ``decode_threads``: the decoder's thread count; see :func:`_threading`.
+      Unset, FFmpeg picks one as if this worker had the machine to itself.
     * ``dense_sizes``: ``[(width, height), ...]``. Every frame of this chunk's
       time range is also resized to each size and pushed as
       ``("__dense__", segment, size_index, [n, H, W, 3] uint8)``, followed by
@@ -69,7 +83,11 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
         container = av.open(str(path))
         try:
             stream = container.streams.video[0]
-            stream.thread_type = _thread_type(stream.codec_context.name, bool(dense_sizes))
+            thread_type, thread_count = _threading(
+                stream.codec_context.name, bool(dense_sizes), options.get("decode_threads"))
+            stream.thread_type = thread_type
+            if thread_count:
+                stream.thread_count = thread_count
             if options.get("skip_nonref") and not dense_sizes:
                 stream.codec_context.skip_frame = "NONREF"
             time_base = stream.time_base
@@ -80,7 +98,8 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
             dense = _DenseEmitter(options, start_t, stream, out_queue) if dense_sizes else None
             exact = dense is not None and dense.needs_exact_start
             produced = 0
-            for frame in _decode_from(container, stream, start_t, exact, dense):
+            rejects = _Rejects(stream) if dense is None else None
+            for frame in _decode_from(container, stream, start_t, exact, dense, tol, rejects):
                 ft = float(frame.pts * time_base)
                 if dense is not None and not dense.finished:
                     dense.add(frame, ft)
@@ -101,6 +120,11 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
                     break
             if dense is not None:
                 dense.close()
+            if rejects is not None and rejects.count:
+                if rejects.unreadable():
+                    raise RuntimeError(
+                        f"the decoder rejected {rejects.count} of {rejects.packets} packets: {rejects.first}")
+                out_queue.put(("__rejected__", start_t, rejects.count, rejects.first))
         finally:
             container.close()
     except Exception as exc:  # surface to the parent as a sentinel payload
@@ -112,7 +136,7 @@ def _decode_chunk_worker(path, start_idx, count, frame_interval, max_long_edge,
         out_queue.put(None)  # done sentinel
 
 
-def _decode_from(container, stream, start_t, exact, tally=None):
+def _decode_from(container, stream, start_t, exact, tally=None, tolerance=0.0, rejects=None):
     """Seek to ``start_t`` and return the decoded frames from there.
 
     A seek lands on the keyframe whose *decode* time is at or before the
@@ -125,11 +149,18 @@ def _decode_from(container, stream, start_t, exact, tally=None):
     only for the seeks that land late.
 
     ``tally`` sees every packet read and every packet the decoder rejects; see
-    :func:`_decoded_frames`. With one, a seek is also retried when a packet
+    :func:`_decoded_frames`, as does ``rejects``. With one, a seek is also retried when a packet
     displayed from ``start_t`` on was read but its frame did not come out
     before the first frame from ``start_t``: a seek that lands mid-GOP, as in
     MPEG-TS, can decode a frame before ``start_t`` and still lose the ones
     after it.
+
+    That check decodes on from the keyframe up to ``start_t``, which in a long
+    GOP is hundreds of frames, at 4K about 12 MB each. Of those only the
+    timestamp of the last is needed for the check, and of the frames only the
+    first, which the caller checks the seek with, and the ones within
+    ``tolerance`` of ``start_t``, which can still be the frame sampled for it;
+    the rest are not kept.
     """
     time_base = stream.time_base
     target = start_t
@@ -140,7 +171,7 @@ def _decode_from(container, stream, start_t, exact, tally=None):
         fresh = False
         if tally is not None:
             tally.restart()
-        frames = _decoded_frames(container, stream, tally)
+        frames = _decoded_frames(container, stream, tally, rejects)
         if not exact or target <= 0:
             return frames
         first = next(frames, None)
@@ -148,31 +179,58 @@ def _decode_from(container, stream, start_t, exact, tally=None):
         # index is not keyframe-accurate, such as MPEG-TS, can land mid-GOP
         # after the last keyframe, and the decoder then drops everything to EOF.
         if first is not None and not _starts_after(first, float(first.pts * time_base), start_t, stream):
-            buffered = [first]
+            kept = [first]
+            last_pts = first.pts
             if tally is not None:
-                while float(buffered[-1].pts * time_base) < start_t - 1e-9:
+                while float(last_pts * time_base) < start_t - 1e-9:
                     following = next(frames, None)
                     if following is None:
                         break
-                    buffered.append(following)
-            if tally is None or not tally.missed_before(buffered[-1].pts):
-                return itertools.chain(buffered, frames)
+                    last_pts = following.pts
+                    if float(last_pts * time_base) + tolerance >= start_t:
+                        kept.append(following)
+            if tally is None or not tally.missed_before(last_pts):
+                return itertools.chain(kept, frames)
         target = max(0.0, start_t - backoff)
         backoff *= 2
 
 
-def _thread_type(codec_name, every_frame):
-    """The decoder threading for a chunk.
+def _threading(codec_name, every_frame, threads=None):
+    """``(thread_type, thread_count)`` for a chunk's decoder.
+
+    ``threads`` is the count the chunk was given, or ``None`` to leave it to
+    FFmpeg, which is then returned as the count too.
 
     Frame threading is what makes PyAV decode fast, but FFmpeg's MPEG-4 Part 2
     decoder returns different frames with it on files with packed B-frames, a
     DivX/Xvid AVI convention, and differently again under load. The every-frame
     consumers need the frames exactly, so they decode MPEG-4 Part 2 on one
-    thread per chunk; the chunks still run in parallel.
+    thread per chunk, whatever the chunk was given; the chunks still run in
+    parallel.
     """
     if every_frame and codec_name == "mpeg4":
-        return "SLICE"  # the decoder has no slice threading, so: one thread
-    return "AUTO"
+        return "SLICE", 1  # the decoder has no slice threading, so: one thread
+    return "AUTO", threads
+
+
+def threads_per_worker(workers, cpus=None):
+    """Decoder threads for each of ``workers`` parallel decode workers.
+
+    FFmpeg sizes a decoder's thread pool by the CPUs of the whole machine, so
+    every worker left to it starts as many threads as there are CPUs, and each
+    frame thread holds reference frames of its own. Splitting the CPUs between
+    the workers keeps them all busy for a fraction of the memory.
+    """
+    if cpus is None:
+        cpus = _available_cpus()
+    return max(1, min(MAX_DECODE_THREADS, cpus // max(1, workers)))
+
+
+def _available_cpus():
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):  # not on Linux
+        return os.cpu_count() or 4
 
 
 def _seek(container, stream, target, fresh):
@@ -194,27 +252,33 @@ def _seek(container, stream, target, fresh):
         container.seek(stream.start_time, stream=stream)
 
 
-def _decoded_frames(container, stream, tally):
+def _decoded_frames(container, stream, tally, rejects=None):
     """The frames of ``stream`` with a timestamp, in display order.
 
-    Without a ``tally`` this is ``container.decode``: a packet the decoder
-    rejects raises. With one, each packet is counted through
-    ``tally.packet(packet)``, a rejected packet goes to
-    ``tally.rejected(packet, exc)`` instead of ending the decode, and a frame
-    without a timestamp, which is dropped either way, is reported through
-    ``tally.untimed_frame()``.
+    With a ``tally``, each packet is counted through ``tally.packet(packet)``,
+    a rejected packet goes to ``tally.rejected(packet, exc)`` instead of
+    ending the decode, and a frame without a timestamp, which is dropped
+    either way, is reported through ``tally.untimed_frame()``. Without one, a
+    rejected packet is counted in ``rejects`` (a :class:`_Rejects`) and
+    skipped; the decoder picks up again at the next frame it can decode.
+    Without either, a rejected packet raises.
     """
     import av
 
     for packet in container.demux(stream):
         if tally is not None:
             tally.packet(packet)
+        elif rejects is not None:
+            rejects.packets += 1
         try:
             frames = packet.decode()
         except av.error.InvalidDataError as exc:
-            if tally is None:
+            if tally is not None:
+                tally.rejected(packet, exc)
+            elif rejects is not None:
+                rejects.add(packet, exc)
+            else:
                 raise
-            tally.rejected(packet, exc)
             continue
         for frame in frames:
             if frame.pts is not None:
@@ -230,6 +294,31 @@ def _starts_after(frame, ft, start_t, stream):
     """
     first_pts = stream.start_time
     return ft > start_t + 1e-9 and not (first_pts is not None and frame.pts <= first_pts)
+
+
+class _Rejects:
+    """Packets the decoder rejected in a chunk that only samples frames.
+
+    Damage in a file, such as a broken packet in a download, costs the frames
+    that depend on it; a sample that would land on one of them takes the next
+    frame that decodes. Only a chunk the decoder rejects throughout is
+    unreadable; see :data:`MAX_REJECTED_SHARE`.
+    """
+
+    def __init__(self, stream):
+        self._time_base = stream.time_base
+        self.packets = 0
+        self.count = 0
+        self.first = None
+
+    def add(self, packet, exc):
+        self.count += 1
+        if self.first is None:
+            at = "" if packet.pts is None else f" at or before {float(packet.pts * self._time_base):.3f}s"
+            self.first = f"{type(exc).__name__}{at}: {exc}"
+
+    def unreadable(self):
+        return self.count > MAX_REJECTED_PACKETS and self.count > MAX_REJECTED_SHARE * self.packets
 
 
 class _DenseEmitter:
@@ -440,10 +529,15 @@ def probe_frame_order(path, frames: int = ORDER_PROBE_FRAMES):
 def iter_parallel_frames(path, frame_interval, max_long_edge, decode_workers,
                          use_timestamps, queue_depth: int = 64, *, skip_nonref: bool = False,
                          dense_sizes=None, dense_crop=None, on_dense=None, on_segment=None,
-                         on_dense_failed=None, emit_interval: bool = True):
+                         on_dense_failed=None, emit_interval: bool = True,
+                         decode_threads_per_worker=None):
     """Yield (out_idx, HWC uint8 ndarray) from parallel decode worker processes.
 
     Frames arrive out of timestamp order; each carries its target time/index.
+
+    Each worker's decoder runs ``decode_threads_per_worker`` threads; ``None``
+    or 0 splits the CPUs between the workers that are started, see
+    :func:`threads_per_worker`.
 
     With ``dense_sizes`` every frame is also delivered, resized to each size,
     through ``on_dense(segment, size_index, frames)``; ``on_segment(segment,
@@ -477,7 +571,7 @@ def iter_parallel_frames(path, frame_interval, max_long_edge, decode_workers,
     # B-frames, one chunk delivers every frame and the rest only sample.
     split_dense, first_pts = probe_frame_order(path) if dense_sizes else (False, None)
 
-    procs = []
+    launches = []
     for segment, (start_idx, count) in enumerate(chunks):
         options = {"skip_nonref": bool(skip_nonref)}
         if dense_sizes and (split_dense or segment == 0):
@@ -492,6 +586,14 @@ def iter_parallel_frames(path, frame_interval, max_long_edge, decode_workers,
             )
         elif not emit_interval:
             continue  # nothing to decode for
+        launches.append((start_idx, count, options))
+
+    threads = int(decode_threads_per_worker or 0)
+    if threads <= 0:
+        threads = threads_per_worker(len(launches))
+    procs = []
+    for start_idx, count, options in launches:
+        options["decode_threads"] = threads
         proc = ctx.Process(
             target=_decode_chunk_worker,
             args=(str(path), start_idx, count if emit_interval else 0, frame_interval,
@@ -516,6 +618,12 @@ def iter_parallel_frames(path, frame_interval, max_long_edge, decode_workers,
                 if item[0] == "__dense__":
                     if on_dense is not None:
                         on_dense(item[1], item[2], item[3])
+                    continue
+                if item[0] == "__rejected__":
+                    _LOGGER.warning(
+                        "Skipped %d damaged packet(s) decoding '%s' in the part from %.1fs; "
+                        "samples there take the next frame that decodes. First: %s",
+                        item[2], path, item[1], item[3])
                     continue
                 if item[0] == "__segment__":
                     if on_segment is not None:

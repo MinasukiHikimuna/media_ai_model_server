@@ -1,5 +1,6 @@
 """Parallel PyAV decode tests. Everything here runs without a GPU."""
 
+import itertools
 import shutil
 import subprocess
 
@@ -91,6 +92,102 @@ def test_a_seek_that_decodes_nothing_starts_further_back(single_keyframe_ts):
 
 
 @pytest.fixture(scope="module")
+def long_gop_mp4(tmp_path_factory):
+    """MP4 with one keyframe in 10 seconds, like the long GOPs of AV1 and
+    streaming encodes. Every segment's seek lands on the keyframe at 0, seconds
+    before the segment starts."""
+    path = tmp_path_factory.mktemp("long_gop") / "long_gop.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", "testsrc2=size=160x90:rate=30000/1001", "-t", "10",
+         "-pix_fmt", "yuv420p", "-c:v", "libx264", "-g", "300", "-keyint_min", "300",
+         "-sc_threshold", "0", "-bf", "2", str(path)],
+        check=True,
+    )
+    return path
+
+
+def _shared_frames(path, workers):
+    """Interval frames by target, segment counts and every frame, from one decode."""
+    segments = {}
+    counts = {}
+
+    def on_dense(segment, _size_index, frames):
+        segments.setdefault(segment, []).append(frames)
+
+    interval = dict(mp_decode.iter_parallel_frames(
+        path, 0.5, 0, workers, True, dense_sizes=[DENSE_SIZE], on_dense=on_dense,
+        on_segment=counts.__setitem__))
+    order = sorted(counts)
+    frames = np.concatenate([clip for segment in order for clip in segments.get(segment, [])])
+    return interval, [counts[segment] for segment in order], frames
+
+
+@needs_ffmpeg
+def test_a_seek_far_before_the_segment_still_delivers_its_frames(long_gop_mp4):
+    interval, counts, frames = _shared_frames(long_gop_mp4, 4)
+    reference_interval, _, reference = _shared_frames(long_gop_mp4, 1)
+
+    assert len(counts) == 4 and all(counts)
+    assert len(reference) == 300
+    np.testing.assert_array_equal(frames, reference)
+    assert sorted(interval) == sorted(reference_interval) and len(interval) == 20
+    for target, frame in reference_interval.items():
+        np.testing.assert_array_equal(interval[target], frame, err_msg=f"target {target}")
+
+
+def test_frames_decoded_before_the_segment_are_not_kept():
+    """Only the first frame, for the seek check, and the frames within the
+    tolerance of the segment start, which can still be sampled for it, are kept
+    of the frames decoded between the keyframe and the segment start."""
+    import gc
+    import weakref
+    from fractions import Fraction
+
+    alive = weakref.WeakSet()
+
+    class _Decoded:
+        def __init__(self, pts):
+            self.pts = pts
+            alive.add(self)
+
+    class _GopPacket(_Packet):
+        def decode(self):
+            return [_Decoded(self.pts)]
+
+    class _Container:
+        def __init__(self):
+            self.seeks = []
+
+        def seek(self, position, stream):
+            self.seeks.append(position)
+
+        def demux(self, _stream):
+            return (_GopPacket(pts) for pts in range(100))  # one keyframe at 0
+
+    class _Tally:
+        def restart(self):
+            pass
+
+        def packet(self, _packet):
+            pass
+
+        def missed_before(self, _pts):
+            return False
+
+    class _TenthStream(_Stream):
+        time_base = Fraction(1, 10)
+
+    container = _Container()
+    frames = mp_decode._decode_from(container, _TenthStream(), 6.0, True, _Tally(), tolerance=0.15)
+    gc.collect()
+
+    assert container.seeks == [60]
+    assert sorted(frame.pts for frame in alive) == [0, 59, 60]
+    assert [frame.pts for frame in itertools.islice(frames, 4)] == [0, 59, 60, 61]
+
+
+@pytest.fixture(scope="module")
 def damaged_clip(tmp_path_factory):
     """H.264 whose frame at 1.4s has a broken NAL length, which the decoder
     rejects like the damage in real downloads. Also returns the clean source."""
@@ -142,12 +239,37 @@ def test_a_damaged_frame_fails_only_the_every_frame_stream(damaged_clip):
 
 
 @needs_ffmpeg
-def test_a_damaged_frame_still_fails_an_interval_only_decode(damaged_clip):
-    """Without every-frame consumers the decode is unchanged: a rejected packet
-    fails it, as it always has."""
-    damaged, _clean = damaged_clip
-    with pytest.raises(RuntimeError, match="InvalidDataError"):
-        list(mp_decode.iter_parallel_frames(damaged, 0.5, 0, 4, True))
+def test_a_damaged_frame_does_not_fail_an_interval_only_decode(damaged_clip, caplog):
+    """Without every-frame consumers a rejected packet costs only the frames
+    that depend on it: every interval target still gets a frame, and the
+    skipped packet is logged."""
+    damaged, clean = damaged_clip
+    targets = sorted(target for target, _frame in mp_decode.iter_parallel_frames(damaged, 0.5, 0, 4, True))
+    clean_targets = sorted(target for target, _frame in mp_decode.iter_parallel_frames(clean, 0.5, 0, 4, True))
+
+    assert targets == clean_targets
+    assert "damaged packet" in caplog.text
+
+
+def test_a_chunk_is_unreadable_only_when_most_of_it_is_rejected():
+    """A long chunk with one damaged stretch keeps going; a chunk the decoder
+    rejects throughout fails."""
+    error = ValueError("rejected")
+    rejects = mp_decode._Rejects(_Stream())
+    rejects.packets = 5000
+    for _ in range(mp_decode.MAX_REJECTED_PACKETS + 100):
+        rejects.add(_Packet(3), error)
+    assert not rejects.unreadable()
+    assert rejects.first == "ValueError at or before 3.000s: rejected"
+
+    rejects.packets = 200
+    assert rejects.unreadable()
+
+    rejects = mp_decode._Rejects(_Stream())
+    rejects.packets = 40
+    for _ in range(mp_decode.MAX_REJECTED_PACKETS):
+        rejects.add(_Packet(3), error)
+    assert not rejects.unreadable()
 
 
 @needs_ffmpeg
@@ -391,9 +513,68 @@ def test_a_video_starting_after_zero_seeks_to_its_start(indexed_flv):
 
 
 def test_mpeg4_part_2_decodes_on_one_thread_for_every_frame_consumers():
-    assert mp_decode._thread_type("mpeg4", True) == "SLICE"
-    assert mp_decode._thread_type("mpeg4", False) == "AUTO"
-    assert mp_decode._thread_type("h264", True) == "AUTO"
+    assert mp_decode._threading("mpeg4", True, 4) == ("SLICE", 1)
+    assert mp_decode._threading("mpeg4", True, None) == ("SLICE", 1)
+    assert mp_decode._threading("mpeg4", False, 4) == ("AUTO", 4)
+    assert mp_decode._threading("h264", True, 4) == ("AUTO", 4)
+    assert mp_decode._threading("h264", True, None) == ("AUTO", None)
+
+
+def test_the_workers_split_the_cpus_between_their_decoders():
+    assert mp_decode.threads_per_worker(8, cpus=32) == 4
+    assert mp_decode.threads_per_worker(8, cpus=12) == 1
+    assert mp_decode.threads_per_worker(8, cpus=4) == 1
+    assert mp_decode.threads_per_worker(3, cpus=16) == 5
+    assert mp_decode.threads_per_worker(1, cpus=64) == mp_decode.MAX_DECODE_THREADS
+    assert mp_decode.threads_per_worker(0, cpus=2) == 2
+
+
+def _launched_options(monkeypatch, path, workers, **kwargs):
+    """The options each worker of a decode is started with. Nothing decodes."""
+    import queue
+
+    launched = []
+
+    class _Context:
+        def Queue(self, maxsize):
+            self.queue = queue.Queue()
+            return self.queue
+
+        def Process(self, target, args, daemon):
+            launched.append(args[-1])
+            context = self
+
+            class _Process:
+                def start(self):
+                    context.queue.put(None)
+
+                def is_alive(self):
+                    return False
+
+                def join(self, timeout):
+                    pass
+
+            return _Process()
+
+    monkeypatch.setattr(mp_decode.mp, "get_context", lambda _method: _Context())
+    monkeypatch.setattr(mp_decode, "_available_cpus", lambda: 16)
+    list(mp_decode.iter_parallel_frames(path, 0.5, 0, workers, True, **kwargs))
+    return launched
+
+
+@needs_ffmpeg
+def test_each_worker_is_given_its_share_of_the_cpus(monkeypatch, open_gop_clip, b_frame_avi):
+    options = _launched_options(monkeypatch, open_gop_clip, 4)
+    assert [option["decode_threads"] for option in options] == [4] * 4
+
+    options = _launched_options(monkeypatch, open_gop_clip, 4, decode_threads_per_worker=3)
+    assert [option["decode_threads"] for option in options] == [3] * 4
+
+    # Only the workers that are started share the CPUs: here one worker
+    # delivers every frame and the others would only have sampled.
+    options = _launched_options(monkeypatch, b_frame_avi, 4, dense_sizes=[DENSE_SIZE],
+                                on_dense=lambda *_: None, emit_interval=False)
+    assert [option["decode_threads"] for option in options] == [8]
 
 
 def test_a_refused_seek_back_to_zero_falls_back_to_the_stream_start():

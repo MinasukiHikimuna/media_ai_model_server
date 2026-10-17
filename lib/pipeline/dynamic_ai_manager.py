@@ -663,6 +663,7 @@ class DynamicAIManager:
                 old = detector_to_spec[dname]
                 if old in spec_remap:
                     detector_to_spec[dname] = spec_remap[old]
+            region_source_spec = spec_remap.get(region_source_spec, region_source_spec)
 
         all_specs = sorted(merged_spec_set, key=lambda s: s.effective_resolution, reverse=True)
 

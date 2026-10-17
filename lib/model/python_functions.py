@@ -1130,9 +1130,10 @@ def _crop_and_resize_region(source_tensor: torch.Tensor, bbox: Sequence[float]) 
     if x2 <= x1 or y2 <= y1:
         raise ValueError("Invalid bbox after clamping; zero-area crop")
 
-    # .clone() to own memory independently of the source tensor so
-    # the full-resolution source can be garbage-collected promptly.
-    cropped = tensor[..., y1:y2, x1:x2].clone()
+    # A float32 copy: owns its memory independently of the source tensor so
+    # the full-resolution source can be garbage-collected promptly, and is
+    # [0,255] float whatever the source's dtype (the region source is 8-bit).
+    cropped = tensor[..., y1:y2, x1:x2].to(torch.float32, copy=True)
     if squeeze:
         cropped = cropped.squeeze(0)
     return cropped
