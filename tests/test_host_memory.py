@@ -37,6 +37,7 @@ class _Source:
         self.frames = frames
         self.emitted = 0
         self.closed_by = None
+        self.closed_thread = None
 
     def __iter__(self):
         return self._generate()
@@ -48,6 +49,7 @@ class _Source:
 
     def close(self):
         self.closed_by = threading.current_thread().name
+        self.closed_thread = threading.current_thread()
 
 
 def _model(monkeypatch, source):
@@ -79,7 +81,8 @@ async def test_a_finished_decode_is_closed_by_its_own_thread(monkeypatch):
     children = root["children"]
     assert len(children) == 100
     await asyncio.gather(*(child.future for child in children))
-    assert source.closed_by == "video-preprocess-producer"
+    assert source.closed_by.startswith("video-preprocess-producer")
+    await model.unload()
 
 
 @pytest.mark.asyncio
@@ -99,9 +102,40 @@ async def test_a_failed_request_stops_the_decode(monkeypatch):
 
     with pytest.raises(RuntimeError, match="inference failed"):
         await root.future
-    assert source.closed_by == "video-preprocess-producer"
+    assert source.closed_by.startswith("video-preprocess-producer")
     assert source.emitted < 1_000_000
-    assert not any(t.name == "video-preprocess-producer" for t in threading.enumerate())
+    await model.unload()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_first", [False, True])
+async def test_videos_reuse_the_producer_thread(monkeypatch, fail_first):
+    sources = [_Source(40), _Source(40)]
+    model = _model(monkeypatch, sources[0])
+    should_fail = [fail_first]
+
+    async def handler(future, key):
+        if key == "frame":
+            if should_fail[0]:
+                should_fail[0] = False
+                raise RuntimeError("inference failed")
+            future.close_future(None)
+
+    try:
+        for index, source in enumerate(sources):
+            model._preprocess_callable = lambda *_args, _source=source, **_kwargs: _source
+            root, item = await _request(handler)
+            await model.worker_function([item])
+            if index == 0 and fail_first:
+                with pytest.raises(RuntimeError, match="inference failed"):
+                    await root.future
+                continue
+            children = root["children"]
+            assert len(children) == 40
+            await asyncio.gather(*(child.future for child in children))
+        assert sources[0].closed_thread is sources[1].closed_thread
+    finally:
+        await model.unload()
 
 
 # ---- the 8-bit region source --------------------------------------------------

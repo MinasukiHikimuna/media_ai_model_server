@@ -5,6 +5,7 @@ import os
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import torch
 from lib.async_lib.async_processing import ItemFuture, model_skip_reason
@@ -136,6 +137,11 @@ class VideoPreprocessorModel(Model):
         # of more transient VRAM for the in-flight batch.
         _pbs = configValues.get("preprocess_batch_size", 32)
         self._preprocess_batch_size = max(1, int(_pbs) if _pbs else 32)
+        # CPU tensor transforms initialize an OpenMP team on the calling
+        # thread. On Windows these native teams can outlive a short-lived
+        # Python thread. Reuse a producer thread across videos so teams and
+        # their resources remain bounded instead of accumulating per video.
+        self._producer_executor = None
 
         requested_backend = str(configValues.get("preprocess_backend", "av_auto")).lower()
 
@@ -195,6 +201,11 @@ class VideoPreprocessorModel(Model):
             self.logger.info(
                 "Video preprocessor using PyAV auto backend (seek when interval >= 1s, threaded otherwise)"
             )
+
+    async def unload(self):
+        executor, self._producer_executor = self._producer_executor, None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _should_skip_decode(self, itemFuture, input_names) -> bool:
         """True when no model downstream of this preprocessor will run."""
@@ -516,11 +527,11 @@ class VideoPreprocessorModel(Model):
                                 self.logger.warning("Closing the decode of '%s' failed: %s", input_data, exc)
                         _put(_FRAME_DONE)
 
-                producer = threading.Thread(
-                    target=_frame_producer, daemon=True,
-                    name="video-preprocess-producer",
-                )
-                producer.start()
+                if self._producer_executor is None:
+                    self._producer_executor = ThreadPoolExecutor(
+                        max_workers=max(1, self.instance_count),
+                        thread_name_prefix="video-preprocess-producer")
+                producer = self._producer_executor.submit(_frame_producer)
 
                 try:
                     _threshold = itemFuture[item.input_names[3]]
@@ -596,18 +607,18 @@ class VideoPreprocessorModel(Model):
                             break
 
                     preprocess_time = _cumulative_cpu[0]
-                    producer.join(timeout=10.0)
+                    wait([producer], timeout=10.0)
                 finally:
                     # Stop the producer (it closes the decode) and drop
                     # whatever it queued.
                     _stop.set()
                     _deadline = time.monotonic() + 60.0
-                    while producer.is_alive() and time.monotonic() < _deadline:
+                    while not producer.done() and time.monotonic() < _deadline:
                         try:
                             _result_q.get(timeout=0.2)
                         except queue.Empty:
                             pass
-                    if producer.is_alive():
+                    if not producer.done():
                         self.logger.warning(
                             "The decode of '%s' did not stop within 60 s; leaving it to finish on its own",
                             input_data)
