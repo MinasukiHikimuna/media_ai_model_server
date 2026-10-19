@@ -531,7 +531,8 @@ class VideoPreprocessorModel(Model):
                     self._producer_executor = ThreadPoolExecutor(
                         max_workers=max(1, self.instance_count),
                         thread_name_prefix="video-preprocess-producer")
-                producer = self._producer_executor.submit(_frame_producer)
+                producer_executor = self._producer_executor
+                producer = producer_executor.submit(_frame_producer)
 
                 try:
                     _threshold = itemFuture[item.input_names[3]]
@@ -620,8 +621,15 @@ class VideoPreprocessorModel(Model):
                             pass
                     if not producer.done():
                         self.logger.warning(
-                            "The decode of '%s' did not stop within 60 s; leaving it to finish on its own",
+                            "The decode of '%s' did not stop within 60 s; retiring its producer executor",
                             input_data)
+                        # A stuck decode must not occupy the next video's
+                        # producer slot. Leave its thread to finish safely,
+                        # but create a fresh executor for later requests.
+                        # Another worker may already have replaced this pool.
+                        if self._producer_executor is producer_executor:
+                            self._producer_executor = None
+                        producer_executor.shutdown(wait=False)
                     while True:
                         try:
                             _result_q.get_nowait()

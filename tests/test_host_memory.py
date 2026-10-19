@@ -3,6 +3,7 @@ and the 8-bit region source."""
 
 import asyncio
 import threading
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -135,6 +136,66 @@ async def test_videos_reuse_the_producer_thread(monkeypatch, fail_first):
             await asyncio.gather(*(child.future for child in children))
         assert sources[0].closed_thread is sources[1].closed_thread
     finally:
+        await model.unload()
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_producer_does_not_block_the_next_video(monkeypatch):
+    closing = threading.Event()
+    release = threading.Event()
+    stuck_executor = None
+
+    class StuckSource(_Source):
+        def close(self):
+            nonlocal stuck_executor
+            stuck_executor = model._producer_executor
+            closing.set()
+            release.wait()
+            super().close()
+
+    stuck_source = StuckSource(BATCH)
+    model = _model(monkeypatch, stuck_source)
+    # Expire the drain deadline without a minute-long wait. Only replace this
+    # module's clock, so asyncio's timeout machinery keeps its real clock.
+    ticks = iter(range(0, 1000, 61))
+    monkeypatch.setattr(vp, "time", SimpleNamespace(
+        perf_counter=vp.time.perf_counter, monotonic=lambda: next(ticks)))
+
+    async def fail_handler(future, key):
+        if key == "frame":
+            assert await asyncio.to_thread(closing.wait, 5)
+            raise RuntimeError("inference failed")
+
+    async def handler(future, key):
+        if key == "frame":
+            future.close_future(None)
+
+    try:
+        root, item = await _request(fail_handler)
+        await asyncio.wait_for(model.worker_function([item]), timeout=5)
+        with pytest.raises(RuntimeError, match="inference failed"):
+            await root.future
+        assert stuck_executor is not None
+        assert model._producer_executor is None
+        assert stuck_source.closed_thread is None
+
+        # The first producer is still blocked; two later videos must both
+        # complete and reuse a healthy replacement thread.
+        sources = [_Source(40), _Source(40)]
+        for source in sources:
+            model._preprocess_callable = lambda *_args, _source=source, **_kwargs: _source
+            root, item = await _request(handler)
+            await asyncio.wait_for(model.worker_function([item]), timeout=5)
+            children = root["children"]
+            assert len(children) == 40
+            await asyncio.gather(*(child.future for child in children))
+            assert stuck_source.closed_thread is None
+        assert model._producer_executor is not stuck_executor
+        assert sources[0].closed_thread is sources[1].closed_thread
+    finally:
+        release.set()
+        if stuck_executor is not None:
+            stuck_executor.shutdown(wait=True)
         await model.unload()
 
 
