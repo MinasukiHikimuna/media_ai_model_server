@@ -1091,6 +1091,7 @@ def preprocess_video_av_seek(
     _mdle = int(max_decode_long_edge) if max_decode_long_edge else 0
 
     container = av.open(str(video_path))
+    worker_owns_container = False
     try:
         stream = container.streams.video[0]
         # Frame threading accelerates the single keyframe decode per seek.
@@ -1118,15 +1119,27 @@ def preprocess_video_av_seek(
         _SENTINEL = None  # signals end-of-stream or error
         prefetch_q: queue.Queue = queue.Queue(maxsize=_PREFETCH_DEPTH)
         prefetch_error: list = []  # mutable container for thread exception
+        stop = threading.Event()
+
+        def _put(value):
+            while not stop.is_set():
+                try:
+                    prefetch_q.put(value, timeout=0.2)
+                    return True
+                except queue.Full:
+                    pass
+            return False
 
         def _prefetch_worker():
             """Seek-decode loop that feeds *prefetch_q* with raw numpy frames."""
             try:
                 idx = 0
                 t = 0.0
-                while t < duration:
+                while t < duration and not stop.is_set():
                     try:
                         container.seek(int(t / time_base), stream=stream)
+                        if stop.is_set():
+                            break
                         frame = None
                         for f in container.decode(video=0):
                             frame = f
@@ -1150,16 +1163,26 @@ def preprocess_video_av_seek(
 
                     out_idx = t if use_timestamps else idx
 
-                    prefetch_q.put((out_idx, frame_np))  # blocks if queue is full
+                    if not _put((out_idx, frame_np)):
+                        break
                     idx += 1
                     t += frame_interval
             except Exception as exc:
                 prefetch_error.append(exc)
             finally:
-                prefetch_q.put(_SENTINEL)
+                # Only the decoding thread may close its container. A timed
+                # join does not make closing it from the consumer safe: the
+                # worker may still be inside libav on a slow or damaged file.
+                try:
+                    container.close()
+                except Exception as exc:
+                    prefetch_error.append(exc)
+                finally:
+                    _put(_SENTINEL)
 
         worker = threading.Thread(target=_prefetch_worker, daemon=True)
         worker.start()
+        worker_owns_container = True
 
         try:
             while True:
@@ -1174,16 +1197,18 @@ def preprocess_video_av_seek(
                 result = _prepare_frame(frame_np, device, vr_video, frame_transforms)
                 yield (out_idx, result)
         finally:
-            # Drain the queue so the worker thread isn't blocked on put()
-            # and can terminate cleanly.
-            while worker.is_alive():
+            stop.set()
+            # Timed puts let a full queue stop without consuming the rest of
+            # the video. A slow in-progress read keeps ownership until it exits.
+            while True:
                 try:
                     prefetch_q.get_nowait()
                 except queue.Empty:
                     break
             worker.join(timeout=2.0)
     finally:
-        container.close()
+        if not worker_owns_container:
+            container.close()
 
 
 
