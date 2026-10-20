@@ -1,4 +1,5 @@
 import logging
+from lib.utils.cuda_health import cuda_health
 
 
 class Model:
@@ -15,6 +16,7 @@ class Model:
 
     async def worker_function_wrapper(self, data):
         try:
+            cuda_health.raise_if_failed()
             await self.worker_function(data)
         except Exception as e:
             for item in data:

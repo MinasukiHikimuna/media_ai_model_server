@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
+from lib.utils.cuda_health import cuda_health
 
 import torch
 from lib.async_lib.async_processing import ItemFuture, model_skip_reason
@@ -30,8 +31,13 @@ from lib.pipeline.preprocess_spec import (
 )
 
 
+MAX_AUTO_PENDING_FRAMES = 4096
+RESULT_QUEUE_DEPTH = 64
+CONSUMER_BATCH_SIZE = 64
+
+
 def compute_auto_pending_frames(per_frame_mb, ram_fraction, assumed_concurrency,
-                                _min=32, _max=4096, _fallback=256):
+                                _min=32, _max=MAX_AUTO_PENDING_FRAMES, _fallback=256):
     """RAM-safe per-video cap on in-flight preprocessed frames.
 
     Preprocessed frames live in system RAM (device="cpu" specs), so the backlog
@@ -207,6 +213,14 @@ class VideoPreprocessorModel(Model):
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
 
+    @property
+    def preprocess_frame_budget(self):
+        """Upper bound including staged frames and shared batch storage."""
+        pending = MAX_AUTO_PENDING_FRAMES if self._max_pending_auto else self._max_pending_frames
+        batch = self._preprocess_batch_size
+        queued = pending + RESULT_QUEUE_DEPTH + CONSUMER_BATCH_SIZE
+        return (((queued + batch - 1) // batch + 1) * batch) * max(1, self.instance_count)
+
     def _should_skip_decode(self, itemFuture, input_names) -> bool:
         """True when no model downstream of this preprocessor will run."""
         downstream = self.downstream_model_names
@@ -249,9 +263,10 @@ class VideoPreprocessorModel(Model):
     async def worker_function(self, data):
         for item in data:
             dense_streams = []
+            itemFuture = item.item_future
             try:
+                cuda_health.raise_if_failed()
                 preprocess_time = 0.0
-                itemFuture = item.item_future
                 input_data = itemFuture[item.input_names[0]]
                 use_timestamps = itemFuture[item.input_names[1]]
                 frame_interval = itemFuture[item.input_names[2]] or self.frame_interval
@@ -445,7 +460,7 @@ class VideoPreprocessorModel(Model):
                 # All three stages overlap.  Total ≈ max(decode, GPU).
 
                 _FRAME_DONE = object()
-                _QUEUE_DEPTH = 64
+                _QUEUE_DEPTH = RESULT_QUEUE_DEPTH
                 _result_q = queue.Queue(maxsize=_QUEUE_DEPTH)
                 _producer_error = []
                 _cumulative_cpu = [0.0]   # mutable float for thread
@@ -514,6 +529,7 @@ class VideoPreprocessorModel(Model):
                         if not _stop.is_set():
                             _flush()
                     except Exception as exc:
+                        cuda_health.record(exc)
                         _producer_error.append(exc)
                     finally:
                         _batch.clear()
@@ -546,7 +562,7 @@ class VideoPreprocessorModel(Model):
                         if first is _FRAME_DONE:
                             return [first]
                         items = [first]
-                        while len(items) < 64:
+                        while len(items) < CONSUMER_BATCH_SIZE:
                             try:
                                 nxt = _result_q.get_nowait()
                                 items.append(nxt)

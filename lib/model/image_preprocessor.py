@@ -4,6 +4,7 @@ import time
 from lib.model.model import Model
 from lib.model.preprocessing_python.image_preprocessing import _load_image_tensor
 from lib.pipeline.preprocess_spec import PreprocessSpec, apply_spec
+from lib.utils.cuda_health import cuda_health
 
 
 class ImagePreprocessorModel(Model):
@@ -33,20 +34,28 @@ class ImagePreprocessorModel(Model):
         # 0 or null = unlimited.
         _max_pending = configValues.get("max_pending_images", 0)
         self._max_pending_images = int(_max_pending) if _max_pending else 0
+        self._pending_slots = None
 
     async def worker_function(self, data):
         loop = asyncio.get_running_loop()
-        semaphore = None
-        if self._max_pending_images > 0:
-            semaphore = asyncio.Semaphore(self._max_pending_images)
+        if self._max_pending_images > 0 and self._pending_slots is None:
+            self._pending_slots = asyncio.Semaphore(self._max_pending_images)
+        semaphore = self._pending_slots
 
         for item in data:
+            itemFuture = item.item_future
             try:
-                itemFuture = item.item_future
+                cuda_health.raise_if_failed()
                 input_data = itemFuture[item.input_names[0]]
 
                 if semaphore is not None:
                     await semaphore.acquire()
+                    if itemFuture.future.done():
+                        semaphore.release()
+                        continue
+                    # Keep the slot through downstream inference, shared by
+                    # all worker calls, rather than only until preprocessing.
+                    itemFuture.future.add_done_callback(lambda _, slots=semaphore: slots.release())
 
                 start_time = time.perf_counter()
 
@@ -59,9 +68,6 @@ class ImagePreprocessorModel(Model):
 
                 for output_key, tensor in spec_tensors.items():
                     await itemFuture.set_data(output_key, tensor)
-
-                if semaphore is not None:
-                    semaphore.release()
 
                 elapsed = time.perf_counter() - start_time
                 root_future = getattr(itemFuture, "root_future", itemFuture)

@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from lib.model.ai_model import AIModel
+from lib.utils.cuda_health import cuda_health
 
 
 face_embedder_DST = np.array(
@@ -47,6 +48,7 @@ class AIFaceEmbeddingModel(AIModel):
         await super().load()
 
     def _run_embedding_item(self, item):
+        cuda_health.raise_if_failed()
         item_future = item.item_future
         tensor = item_future[item.input_names[0]]
         if not isinstance(tensor, torch.Tensor):
@@ -93,7 +95,10 @@ class AIFaceEmbeddingModel(AIModel):
                 return None
 
             return _norm_crop_gpu(source_tensor, kps, image_size=112)
-        except Exception:
+        except Exception as exc:
+            cuda_health.record(exc)
+            if cuda_health.failed:
+                raise  # preserve a fatal GPU error instead of trying a fallback
             return None
 
 

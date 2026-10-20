@@ -5,6 +5,7 @@ import time
 from lib.model.ai_model import AIModel
 from lib.model.skip_input import Skip
 from lib.model.whole_asset import is_whole_asset_model
+from lib.utils.cuda_health import cuda_health
 
 logger = logging.getLogger("logger")
 
@@ -14,6 +15,7 @@ class ItemFuture:
         self.handler = event_handler
         self.future = asyncio.Future()
         self.data = {}
+        cuda_health.track(self)
         root_candidate = self._resolve_root_future(parent)
         if root_candidate is None:
             root_candidate = self
@@ -37,6 +39,7 @@ class ItemFuture:
         self.future.set_result(value)
 
     def set_exception(self, exception):
+        cuda_health.record(exception)
         if self.future.done():
             return
         self.data = None
@@ -149,6 +152,14 @@ class ModelProcessor():
         )
 
     async def _complete_if_skipped(self, item):
+        if item.item_future.future.done():
+            return True
+        if cuda_health.failed:
+            try:
+                cuda_health.raise_if_failed()
+            except RuntimeError as exc:
+                item.item_future.set_exception(exc)
+            return True
         reason = self._skip_reason(item)
         if reason is None:
             return False
@@ -190,17 +201,21 @@ class ModelProcessor():
                     continue
             
             if len(batch_data) > 0:
+                # A sibling may have failed while we collected the batch.
+                ready_data = [item for item in batch_data if not item.item_future.future.done()]
                 start_time = time.perf_counter() if self.is_ai_model else None
                 try:
-                    await self.model.worker_function_wrapper(batch_data)
+                    if ready_data:
+                        await self.model.worker_function_wrapper(ready_data)
                 finally:
                     if self.is_ai_model and start_time is not None:
                         elapsed = time.perf_counter() - start_time
-                        self._record_ai_runtime(batch_data, elapsed)
+                        self._record_ai_runtime(ready_data, elapsed)
                     for _ in batch_data:
                         self.queue.task_done()
 
     async def start_workers(self):
+        cuda_health.raise_if_failed()
         if self.workers_started:
             if self.failed_loading:
                 raise Exception("Error: Model failed to load!")
