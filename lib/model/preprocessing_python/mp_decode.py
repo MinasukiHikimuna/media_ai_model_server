@@ -17,6 +17,7 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import queue
 from typing import Optional
 
 _LOGGER = logging.getLogger("logger")
@@ -607,7 +608,16 @@ def iter_parallel_frames(path, frame_interval, max_long_edge, decode_workers,
     error = None
     try:
         while finished < len(procs):
-            item = out_queue.get()
+            crashed = [p for p in procs if getattr(p, "exitcode", None) not in (None, 0)]
+            if crashed:
+                raise RuntimeError(
+                    f"parallel decode worker exited without completing (exit code {crashed[0].exitcode})")
+            try:
+                item = out_queue.get(timeout=0.5)
+            except queue.Empty:
+                if all(p.exitcode is not None for p in procs):
+                    raise RuntimeError("parallel decode workers exited without all completion messages")
+                continue
             if item is None:
                 finished += 1
                 continue

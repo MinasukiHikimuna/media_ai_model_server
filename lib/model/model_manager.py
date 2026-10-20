@@ -129,18 +129,9 @@ class ModelManager:
             return
         device = ai_model_instances[0].device
 
-        # Find max_pending_frames from any video preprocessor
-        max_pending_frames = 0
-        for mp in self.models.values():
-            if mp is None:
-                continue
-            inner = getattr(mp, 'model', None)
-            if inner is not None and hasattr(inner, '_max_pending_frames'):
-                max_pending_frames = max(max_pending_frames,
-                                         inner._max_pending_frames)
-
-        compute_batch_sizes(ai_model_instances, device,
-                            max_pending_frames=max_pending_frames)
+        preprocessors = [mp.model for mp in self.models.values()
+                         if mp is not None and isinstance(mp.model, (VideoPreprocessorModel, ImagePreprocessorModel))]
+        compute_batch_sizes(ai_model_instances, device, preprocessors=preprocessors)
         # Sync ModelProcessor fields with updated child model values
         for mp in model_processors:
             if mp is not None:

@@ -35,6 +35,10 @@ Before becoming a patron or installing the free model, please be aware of the fo
 
 - **Performance on CPU**: While CPU is supported, it will be much slower compared to running on a GPU.
 
+- **Fatal CUDA errors**: An illegal memory access, device assertion, or fatal launch error makes the process unhealthy. Pending work fails and HTTP requests, including health checks, return 503 with `restart_required: true` until the server process is restarted. An ordinary out-of-memory error does not trigger this state. For diagnosis, set `CUDA_LAUNCH_BLOCKING=1` and `TORCH_SHOW_CPP_STACKTRACES=1` before starting Python; synchronous GPU launches can reduce throughput.
+
+- **GPU preprocessing memory**: VRAM budgeting uses the pipeline's actual GPU tensor sizes and precision, including queued video frames, staging buffers, and worker concurrency. Auto video backlogs reserve their maximum bound before the source dimensions are known. GPU preprocessing specs need a fixed size or `max_long_edge`, and GPU image preprocessing needs a positive `max_pending_images`. Image slots stay occupied until downstream processing finishes. CPU-only preprocessing does not reserve GPU backlog storage.
+
 - **Complexity and Support**: Running machine learning models is complex and requires precise conditions to work smoothly. Although I have worked to make the installation process and AI model predictions as user-friendly as possible, due to the variability in hardware and software environments, there might be issues. I will do my best to help resolve any issues, but I cannot guarantee that the models will run on every computer.
 
 - **Model Access**: The most capable models are for paid patrons only because this project takes an enormous amount of time, and SubscribeStar funds future development. There is a free model available with less tags for users that may not care about all the tags or want to try the AI before considering becoming a patron.

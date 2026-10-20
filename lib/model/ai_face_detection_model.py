@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torchvision.io import read_image
 
 from lib.model.ai_model import AIModel
+from lib.utils.cuda_health import cuda_health
 
 
 class AIFaceDetectionModel(AIModel):
@@ -35,6 +36,7 @@ class AIFaceDetectionModel(AIModel):
         )
 
     def _run_detection_item(self, item):
+        cuda_health.raise_if_failed()
         item_future = item.item_future
         threshold = item_future[item.input_names[1]]
         if threshold is None:

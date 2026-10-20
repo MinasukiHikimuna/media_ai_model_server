@@ -23,6 +23,7 @@ from lib.logging.logger import setup_logger
 from lib.pipeline.pipeline_manager import PipelineManager
 from lib.server.exceptions import NoActiveModelsException, ServerStopException
 from lib.utils.memory_utils import clear_gpu_cache
+from lib.utils.cuda_health import cuda_health
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 import requests
@@ -103,6 +104,7 @@ class ServerManager:
         self.background_task = asyncio.create_task(check_inactivity())
 
     async def get_request_future(self, data, pipeline_name):
+        cuda_health.raise_if_failed()
         if self.reloading:
             raise RuntimeError("Model pipelines are reloading")
         if not self.pipeline_manager.has_pipeline(pipeline_name):
@@ -470,6 +472,9 @@ app.add_middleware(BaseHTTPMiddleware, dispatch=outstanding_requests_middleware.
 
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
+    if cuda_health.failed:
+        return JSONResponse({"detail": "CUDA execution failed; restart the server before submitting more work",
+                             "restart_required": True}, status_code=503)
     try:
         response = await call_next(request)
     except Exception as e:
@@ -486,7 +491,7 @@ async def check_inactivity():
         middleware = outstanding_requests_middleware
         if middleware.outstanding_requests == 0 and asyncio.get_event_loop().time() - middleware.last_request_timestamp > 300 and middleware.last_request_timestamp > last_request_timestamp:
             last_request_timestamp = middleware.last_request_timestamp
-            if server_manager.reloading:
+            if server_manager.reloading or cuda_health.failed:
                 continue
 
             print("No requests in the last 5 minutes, Clearing cached memory")

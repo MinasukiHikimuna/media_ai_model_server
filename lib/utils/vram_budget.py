@@ -1,6 +1,7 @@
 import logging
 import os
 import torch
+from lib.pipeline.preprocess_spec import PreprocessSpec
 
 logger = logging.getLogger("logger")
 
@@ -52,27 +53,48 @@ def _estimate_preprocess_tensor_mb(image_size, half_precision=True):
 
 
 def _collect_gpu_preprocess_specs(ai_models):
-    """Derive unique GPU preprocess specs from all AI models.
+    """Fallback for callers without the pipeline's actual preprocessor specs."""
+    return {spec for model in ai_models
+            if getattr(model, "model_image_size", 0)
+            for spec in [PreprocessSpec.for_model(model)] if spec.device != "cpu"}
 
-    Returns list of (width, half_precision) tuples for specs
-    that will reside on GPU.
+
+def _gpu_spec_mb(spec):
+    if getattr(spec, "device", "cpu") == "cpu":
+        return 0.0
+    if spec.width > 0 and spec.height > 0:
+        pixels = spec.width * spec.height
+    elif spec.max_long_edge > 0:
+        pixels = spec.max_long_edge ** 2  # square is the largest possible frame
+    else:
+        raise ValueError(f"GPU preprocessing spec {spec.key} needs a fixed size or max_long_edge for VRAM budgeting")
+    bytes_per_element = torch.empty((), dtype=spec.effective_dtype).element_size()
+    return 3 * pixels * bytes_per_element / (1024 ** 2)
+
+
+def estimate_preprocess_storage_mb(preprocessors):
+    """Reserve actual GPU specs, auto backlogs, staging and worker concurrency.
+
+    CPU tensors do not consume this budget. Temporary transform/inference
+    workspaces remain covered by the separate overhead/activation reserve.
     """
+    storage_mb = 0.0
     seen = set()
-    specs = []
-    for model in ai_models:
-        image_size = getattr(model, 'model_image_size', None)
-        if image_size is None or image_size <= 0:
+    for preprocessor in preprocessors:
+        if id(preprocessor) in seen:
             continue
-        device = getattr(model, 'device', 'cuda')
-        if device in ('cpu', 'mps'):
+        seen.add(id(preprocessor))
+        specs = set(getattr(preprocessor, "specs", ()))
+        per_frame_mb = sum(_gpu_spec_mb(spec) for spec in specs)
+        if not per_frame_mb:
             continue
-        capabilities = set(getattr(model, 'model_capabilities', []) or [])
-        half = 'detection' not in capabilities
-        key = (image_size, half)
-        if key not in seen:
-            seen.add(key)
-            specs.append((image_size, half))
-    return specs
+        frames = getattr(preprocessor, "preprocess_frame_budget", None)
+        if frames is None:
+            frames = getattr(preprocessor, "_max_pending_images", 0)
+            if frames <= 0:
+                raise ValueError("GPU image preprocessing requires max_pending_images > 0 for VRAM budgeting")
+        storage_mb += frames * per_frame_mb
+    return storage_mb
 
 
 def _round_to_8(n):
@@ -91,7 +113,7 @@ def _round_to_8(n):
 
 
 def compute_batch_sizes(ai_models, device_str, max_pending_frames=0,
-                        overhead_mb=_DEFAULT_OVERHEAD_MB):
+                        overhead_mb=_DEFAULT_OVERHEAD_MB, preprocessors=None):
     """Compute batch sizes for all AI models using VRAM budget allocation.
 
     All dynamically-scaled models share the same pipeline, so the effective
@@ -111,6 +133,8 @@ def compute_batch_sizes(ai_models, device_str, max_pending_frames=0,
         device_str: Device string ("cuda", "xpu", etc.).
         max_pending_frames: Max queued video frames; 0 = images only (1 set).
         overhead_mb: Reserved VRAM for CUDA context and OS.
+        preprocessors: Actual pipeline preprocessors, including their specs
+            and bounded backlog/staging counts. Preferred over the fallback.
     """
     total_vram_mb = get_total_vram_mb(device_str)
     if total_vram_mb == 0:
@@ -130,20 +154,11 @@ def compute_batch_sizes(ai_models, device_str, max_pending_frames=0,
     total_weights_mb = sum(weight_estimates.values())
 
     # ── 2. Preprocessed frame/image storage on GPU ──────────────────────
-    # NOTE: The video preprocessor keeps all pending frames on CPU
-    # (producer thread forces device="cpu" on specs).  Frames are only
-    # moved to GPU inside the model's batched inference call, so the GPU
-    # memory for queued tensors is bounded by queue depth, not
-    # max_pending_frames.  For single-image requests there is still 1 set
-    # on GPU.  We reserve space for a small number of in-flight sets
-    # (enough to cover model queue depth) rather than all pending frames.
-    gpu_specs = _collect_gpu_preprocess_specs(ai_models)
-    per_frame_mb = sum(_estimate_preprocess_tensor_mb(size, hp)
-                       for size, hp in gpu_specs)
-    # In-flight on GPU: at most ~1 batch per model being processed +
-    # a few queued.  Use a fixed reasonable estimate (e.g. 64 sets).
-    queued_sets = min(max(max_pending_frames, 1), 64)
-    preprocess_storage_mb = per_frame_mb * queued_sets
+    if preprocessors is not None:
+        preprocess_storage_mb = estimate_preprocess_storage_mb(preprocessors)
+    else:
+        per_frame_mb = sum(_gpu_spec_mb(spec) for spec in _collect_gpu_preprocess_specs(ai_models))
+        preprocess_storage_mb = per_frame_mb * max(max_pending_frames, 1)
 
     # ── 3. Available VRAM for batch activations ─────────────────────────
     available_mb = (total_vram_mb - total_weights_mb
@@ -153,8 +168,7 @@ def compute_batch_sizes(ai_models, device_str, max_pending_frames=0,
         f"VRAM budget: total={total_vram_mb:.0f}MB, "
         f"weights={total_weights_mb:.0f}MB ({len(ai_models)} models), "
         f"preprocess_queue={preprocess_storage_mb:.0f}MB "
-        f"({queued_sets} sets × {per_frame_mb:.1f}MB/set, "
-        f"{len(gpu_specs)} specs), "
+        f"(GPU specs and bounded backlogs), "
         f"overhead={overhead_mb}MB, "
         f"available={available_mb:.0f}MB"
     )

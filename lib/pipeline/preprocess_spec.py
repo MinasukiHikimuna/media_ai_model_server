@@ -13,6 +13,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from lib.utils.cuda_health import cuda_health
 
 
 # Normalization presets: id → (mean, std) for per-channel [0,1]-scaled tensors.
@@ -235,6 +236,7 @@ def apply_spec(source: torch.Tensor, spec: PreprocessSpec) -> torch.Tensor:
     the spec's target device with the requested resolution, normalization,
     and precision.
     """
+    cuda_health.raise_if_failed()
     t = source
     h, w = t.shape[-2], t.shape[-1]
     resized = False
@@ -259,6 +261,8 @@ def apply_spec(source: torch.Tensor, spec: PreprocessSpec) -> torch.Tensor:
             top = (ch - spec.height) // 2
             left = (cw - spec.width) // 2
             t = t[:, top : top + spec.height, left : left + spec.width]
+            if spec.normalization < 0 and spec.effective_dtype == t.dtype:
+                t = t.clone()  # do not retain the larger resized backing store
             resized = True
         elif h != spec.height or w != spec.width:
             t = F.interpolate(
@@ -324,6 +328,7 @@ def apply_spec_batch(source: torch.Tensor, spec: PreprocessSpec) -> torch.Tensor
 
     All frames in a batch must share the same H, W (true for one video).
     """
+    cuda_health.raise_if_failed()
     t = source
     if t.dim() != 4:
         raise ValueError(f"apply_spec_batch expects [N, C, H, W]; got {tuple(t.shape)}")
@@ -354,6 +359,8 @@ def apply_spec_batch(source: torch.Tensor, spec: PreprocessSpec) -> torch.Tensor
             top = (ch - spec.height) // 2
             left = (cw - spec.width) // 2
             t = t[:, :, top : top + spec.height, left : left + spec.width]
+            if spec.normalization < 0 and spec.effective_dtype == t.dtype:
+                t = t.clone()
             resized = True
         elif h != spec.height or w != spec.width:
             t = F.interpolate(t, size=(spec.height, spec.width), mode=interp_mode, align_corners=False)
