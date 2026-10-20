@@ -6,6 +6,7 @@ levels with a stub artifact: no GPU and no real model.
 """
 import importlib.util
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -92,20 +93,24 @@ def test_inference_microbench_runs_the_current_model():
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-def test_measure_model_analyses_a_real_clip(tmp_path):
+def test_measure_model_analyses_a_real_clip(tmp_path, monkeypatch):
     clip = tmp_path / "clip.mp4"
     subprocess.run(
         ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30",
          "-t", "2", "-pix_fmt", "yuv420p", "-c:v", "libx264", str(clip)],
         check=True,
     )
+    # The shared decode splits the clip at its 1s sampling grid, between as many
+    # workers as there are CPUs: with enough of them, two segments of 30 frames.
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
     bench = _load_bench()
     model = _stub_model()
     result = bench.measure_model(_context(bench, model), {"excerpt": {"file": str(clip)}}, "L4")
     detail = result["detail"]
     assert result["frames"] == 60
-    assert detail["backend"] == "ffmpeg_cpu"
-    assert detail["windows"] == 3 and detail["boundaries"] == 3
+    assert detail["backend"] == "shared_pyav"
+    # Each segment is windowed on its own: 20 frames, then 10 padded to 20.
+    assert detail["windows"] == 4 and detail["boundaries"] == 4
     assert detail["first_frame_s"] is not None and len(detail["boundaries_sha1"]) == 12
     # Instrumentation is undone: the model's own methods are back.
     assert "_run_window" not in vars(model) and "run_raw_multi_output" not in vars(model.model)

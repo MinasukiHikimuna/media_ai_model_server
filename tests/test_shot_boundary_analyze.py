@@ -12,6 +12,7 @@ import pytest
 import lib.model.ai_shot_boundary_model as sbm
 from lib.async_lib.async_processing import ItemFuture, QueueItem
 from lib.model.preprocessing_python.ffmpeg_pipe import VideoInfo
+from lib.model.preprocessing_python.mp_decode import DENSE_CLIP_FRAMES
 from lib.model.python_functions import _apply_asset_results, asset_result_collector
 from lib.pipeline.preprocess_spec import PreprocessSpec
 
@@ -44,15 +45,23 @@ class ScriptedModel:
         return shot, intra, inter
 
 
+def _one_segment(count, width, height):
+    """``count`` blank frames as the shared decode's stream delivers them: one
+    segment, in clips of ``DENSE_CLIP_FRAMES``."""
+    blank = np.zeros((height, width, 3), dtype=np.uint8)
+    for start in range(0, count, DENSE_CLIP_FRAMES):
+        yield 0, np.stack([blank] * min(DENSE_CLIP_FRAMES, count - start))
+
+
 class FakeSource:
     backend_name = "fake"
 
     def __init__(self, count):
         self.count = count
+        self.segment_counts = [count]
 
     def __iter__(self):
-        blank = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
-        return ((index, blank) for index in range(self.count))
+        return _one_segment(self.count, WIDTH, HEIGHT)
 
 
 def make_model(monkeypatch, *, window, context, ends_per_window, frames, fps=25.0,
@@ -112,11 +121,10 @@ class SizedSource:
 
     def __init__(self, count, size):
         self.count, self.size = count, size
+        self.segment_counts = [count]
 
     def __iter__(self):
-        width, height = self.size
-        blank = np.zeros((height, width, 3), dtype=np.uint8)
-        return ((index, blank) for index in range(self.count))
+        return _one_segment(self.count, *self.size)
 
 
 def test_a_vr_video_is_padded_like_its_frames(monkeypatch):
